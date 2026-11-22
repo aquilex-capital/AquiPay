@@ -2,7 +2,8 @@ import { createWalletClient, parseEventLogs, type Address, type Hex } from 'viem
 import { privateKeyToAccount } from 'viem/accounts'
 import type { ChainConfig } from './config.ts'
 import { publicClient, rpcTransport, type Context } from './context.ts'
-import { erc20Abi, factoryAbi } from './forwarder.ts'
+import { factoryAbi } from './forwarder.ts'
+import { balancesAt } from './watcher.ts'
 
 interface Candidate {
   id: string
@@ -20,10 +21,15 @@ export async function sweepTick(ctx: Context, chain: ChainConfig): Promise<Hex |
   if (!config.sweeperPrivateKey) throw new Error('SWEEPER_PRIVATE_KEY is required')
   const client = publicClient(chain)
 
+  // Only addresses the watcher has finished with: it finds payments by a
+  // balance going up, so emptying an address it still reads could hide one.
   const candidates = await sql<Candidate[]>`
     select distinct i.id, i.salt, i.address
-    from transfers t join invoices i on i.id = t.invoice_id
+    from transfers t
+    join invoices i on i.id = t.invoice_id
+    join watch_state w on w.invoice_id = i.id and w.chain = t.chain
     where t.chain = ${chain.key} and t.status = 'confirmed' and t.swept_at is null and t.sweep_error is null
+      and w.balance is not null and w.checked_at >= i.expires_at + make_interval(secs => ${config.lateWindowSeconds})
     limit ${config.sweepBatchSize}`
   if (candidates.length === 0) return
 
@@ -35,10 +41,7 @@ export async function sweepTick(ctx: Context, chain: ChainConfig): Promise<Hex |
     }
   }
 
-  const balanceOf = (address: Address) =>
-    client.readContract({ address: chain.usdt, abi: erc20Abi, functionName: 'balanceOf', args: [address] })
-
-  const balances = await Promise.all(candidates.map((c) => balanceOf(c.address)))
+  const balances = await balancesAt(ctx, chain, candidates.map((c) => c.address))
   const funded = candidates.filter((_, i) => balances[i]! > 0n)
   // Anyone may flush a deployed forwarder, so an empty one has already been swept.
   const alreadyEmpty = candidates.filter((_, i) => balances[i] === 0n)

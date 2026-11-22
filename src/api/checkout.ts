@@ -3,6 +3,8 @@ import QRCode from 'qrcode'
 export interface CheckoutView {
   invoiceId: string
   address: string
+  /** How long the address stays live; 0 when it already has expired. */
+  secondsLeft: number
   nonce: string
   networks: { key: string; name: string; minAmount: string; explorerTx: string }[]
 }
@@ -44,7 +46,8 @@ const STYLE = `
 body { margin: 0; padding: 56px 16px 72px; background: var(--void); color: var(--phosphor);
   font: 400 clamp(1rem, 0.96rem + 0.2vw, 1.05rem)/1.55 var(--sans); font-feature-settings: "ss01";
   -webkit-font-smoothing: antialiased; }
-main { max-width: 35rem; margin: 0 auto; display: flex; flex-direction: column; gap: 1.125rem; }
+main, .stack { display: flex; flex-direction: column; gap: 1.125rem; }
+main { max-width: 35rem; margin: 0 auto; }
 header { margin-bottom: 0.875rem; }
 h1 { margin: 0 0 0.35em; font: 700 clamp(1.6875rem, 1.2rem + 1.9vw, 2.375rem)/1.05 var(--mono);
   letter-spacing: -0.015em; color: var(--heading); text-wrap: balance; }
@@ -90,6 +93,7 @@ a:hover { color: var(--telemetry-link); }
   letter-spacing: 0.04em; white-space: nowrap; }
 .go:hover { filter: brightness(1.1); }
 .actions .fine { flex: 1; min-width: 14rem; }
+.clock { font-variant-numeric: tabular-nums; color: var(--phosphor); }
 .notice { padding: 0.75rem 1rem; background: var(--callout); border-left: 2px solid var(--signal);
   border-radius: 0 6px 6px 0; font-size: 0.875rem; color: var(--signal-dim); }
 
@@ -120,6 +124,25 @@ const SCRIPT = `
 const data = JSON.parse(document.getElementById('data').textContent);
 const byKey = Object.fromEntries(data.networks.map((n) => [n.key, n]));
 
+// Counted from when the page arrived, so a wrong clock on this device does not matter.
+const deadline = Date.now() + data.secondsLeft * 1000;
+const clock = document.getElementById('clock');
+let timer = null;
+function expire() {
+  clearInterval(timer);
+  document.getElementById('live')?.remove();
+  document.getElementById('expired').hidden = false;
+}
+function countDown() {
+  const left = Math.ceil((deadline - Date.now()) / 1000);
+  if (left <= 0) return expire();
+  clock.textContent = Math.floor(left / 60) + ':' + String(left % 60).padStart(2, '0');
+}
+if (clock) {
+  countDown();
+  timer = setInterval(countDown, 1000);
+}
+
 function showNetwork(key) {
   const network = byKey[key];
   document.getElementById('notice').textContent =
@@ -132,7 +155,7 @@ for (const input of document.querySelectorAll('.network input')) {
 }
 
 const copy = document.getElementById('copy');
-copy.addEventListener('click', async () => {
+copy?.addEventListener('click', async () => {
   try {
     await navigator.clipboard.writeText(data.address);
     copy.textContent = 'Address copied';
@@ -186,7 +209,8 @@ async function refresh() {
   try {
     const response = await fetch(location.pathname + '/status', { cache: 'no-store' });
     if (!response.ok) return;
-    const { transfers } = await response.json();
+    const { expired, transfers } = await response.json();
+    if (expired) expire();
     const now = new Set(transfers.filter((t) => t.credited).map((t) => t.tx_hash));
     const rows = transfers.map((t) => row(t, credited !== null && t.credited && !credited.has(t.tx_hash)));
     credited = now;
@@ -246,11 +270,10 @@ export async function renderCheckout(view: CheckoutView): Promise<string> {
     .join('\n    ')
   const first = view.address.slice(0, 6)
   const last = view.address.slice(-4)
-  const body = `  <header>
-    <h1>Top up with USDT</h1>
-    <p class="lede">Send from any wallet or exchange. This page updates on its own when your payment arrives.</p>
-  </header>
-
+  const minutes = Math.floor(view.secondsLeft / 60)
+  const clock = `${minutes}:${String(view.secondsLeft % 60).padStart(2, '0')}`
+  // Once expired, the address is not on the page at all, so nobody copies it from a stale tab.
+  const live = view.secondsLeft === 0 ? '' : `<div id="live" class="stack">
   <section class="card">
     <h2 class="card-head" id="network-heading">Network you send on</h2>
     <div class="card-body">
@@ -272,6 +295,21 @@ export async function renderCheckout(view: CheckoutView): Promise<string> {
         <p class="fine">After pasting, check that it starts with ${escapeHtml(first)} and ends with ${escapeHtml(last)}.</p>
       </div>
       <p class="notice" id="notice" role="note"></p>
+      <p class="fine">This address is yours for <span class="clock" id="clock" role="timer">${clock}</span> more. Send before then: a payment sent in time counts even if it arrives later.</p>
+    </div>
+  </section>
+  </div>`
+  const body = `  <header>
+    <h1>Top up with USDT</h1>
+    <p class="lede">Send from any wallet or exchange. This page updates on its own when your payment arrives.</p>
+  </header>
+
+  ${live}
+  <section class="card" id="expired"${view.secondsLeft === 0 ? '' : ' hidden'}>
+    <h2 class="card-head">Deposit address</h2>
+    <div class="card-body">
+      <p class="notice" role="alert">This address has expired. Don't send to it. Start a new payment from where you came, and you get a new address.</p>
+      <p class="fine">A payment you sent before it expired is still credited when it arrives, and shows below.</p>
     </div>
   </section>
 
@@ -282,7 +320,7 @@ export async function renderCheckout(view: CheckoutView): Promise<string> {
       <ul class="payments" id="payments" aria-live="polite"></ul>
     </div>
   </section>`
-  const script = `<script type="application/json" id="data">${scriptJson({ address: view.address, networks: view.networks })}</script>
+  const script = `<script type="application/json" id="data">${scriptJson({ address: view.address, secondsLeft: view.secondsLeft, networks: view.networks })}</script>
 <script nonce="${view.nonce}">${SCRIPT}</script>`
   return page(view.nonce, 'Top up with USDT', body, script)
 }

@@ -10,9 +10,19 @@ interface ChainDefaults {
   decimals: number
   confirmations: number
   minTopup: string
-  pollMs: number
+  /** How often a live checkout's balance is read. */
+  pollSeconds: number
+  /**
+   * A lower bound on the time between blocks, so that a count of blocks
+   * derived from it reaches back at least as far as an invoice's age. 0 means
+   * "from the first block", for anvil, which mines a block per transaction.
+   */
+  minBlockMs: number
   explorerTx: string
 }
+
+/** Multicall3's address on every chain that has it. */
+export const MULTICALL3: Address = '0xcA11bde05977b3631167028862bE2a173976CA11'
 
 const CHAIN_DEFAULTS: Record<string, ChainDefaults> = {
   ethereum: {
@@ -22,7 +32,8 @@ const CHAIN_DEFAULTS: Record<string, ChainDefaults> = {
     decimals: 6,
     confirmations: 12,
     minTopup: '20',
-    pollMs: 6000,
+    pollSeconds: 12,
+    minBlockMs: 6000,
     explorerTx: 'https://etherscan.io/tx/',
   },
   arbitrum: {
@@ -32,7 +43,8 @@ const CHAIN_DEFAULTS: Record<string, ChainDefaults> = {
     decimals: 6,
     confirmations: 60,
     minTopup: '10',
-    pollMs: 3000,
+    pollSeconds: 5,
+    minBlockMs: 100,
     explorerTx: 'https://arbiscan.io/tx/',
   },
   optimism: {
@@ -42,7 +54,8 @@ const CHAIN_DEFAULTS: Record<string, ChainDefaults> = {
     decimals: 6,
     confirmations: 15,
     minTopup: '10',
-    pollMs: 3000,
+    pollSeconds: 5,
+    minBlockMs: 500,
     explorerTx: 'https://optimistic.etherscan.io/tx/',
   },
   polygon: {
@@ -52,7 +65,8 @@ const CHAIN_DEFAULTS: Record<string, ChainDefaults> = {
     decimals: 6,
     confirmations: 64,
     minTopup: '10',
-    pollMs: 3000,
+    pollSeconds: 5,
+    minBlockMs: 500,
     explorerTx: 'https://polygonscan.com/tx/',
   },
   bsc: {
@@ -63,7 +77,8 @@ const CHAIN_DEFAULTS: Record<string, ChainDefaults> = {
     decimals: 18,
     confirmations: 20,
     minTopup: '10',
-    pollMs: 3000,
+    pollSeconds: 5,
+    minBlockMs: 100,
     explorerTx: 'https://bscscan.com/tx/',
   },
   // Local anvil node for development and tests; USDT_ADDRESS_LOCAL is required.
@@ -73,7 +88,8 @@ const CHAIN_DEFAULTS: Record<string, ChainDefaults> = {
     decimals: 6,
     confirmations: 2,
     minTopup: '10',
-    pollMs: 1000,
+    pollSeconds: 1,
+    minBlockMs: 0,
     explorerTx: '',
   },
 }
@@ -89,6 +105,10 @@ export interface ChainConfig {
   minTopupRaw: bigint
   pollMs: number
   logRange: bigint
+  minBlockMs: number
+  multicall3: Address
+  /** Whether the RPC answers balance reads at past blocks; without them, changes are found by scanning logs. */
+  historicalReads: boolean
   rpcUrls: string[]
   maxGasPriceWei?: bigint
   explorerTx: string
@@ -107,6 +127,14 @@ export interface Config {
   sweeperPrivateKey?: Hex
   sweepIntervalMs: number
   sweepBatchSize: number
+  /** How long a new invoice's address is live. */
+  invoiceTtlSeconds: number
+  /** How long after expiry a payment is still looked for and credited. */
+  lateWindowSeconds: number
+  /** How often addresses inside that window are read. */
+  latePassMs: number
+  /** Addresses per Multicall3 call. */
+  multicallBatch: number
 }
 
 type Env = Record<string, string | undefined>
@@ -123,12 +151,27 @@ function address(env: Env, name: string): Address {
   return getAddress(value)
 }
 
-function positiveInt(env: Env, name: string, fallback: number): number {
+function positiveInt(env: Env, name: string, fallback: number, { zero = false } = {}): number {
   const raw = env[name]
   if (!raw) return fallback
   const value = Number(raw)
-  if (!Number.isInteger(value) || value <= 0) throw new Error(`${name} must be a positive integer`)
+  if (!Number.isInteger(value) || value < (zero ? 0 : 1)) {
+    throw new Error(`${name} must be a ${zero ? 'non-negative' : 'positive'} integer`)
+  }
   return value
+}
+
+function boolean(env: Env, name: string, fallback: boolean): boolean {
+  const raw = env[name]?.toLowerCase()
+  if (!raw) return fallback
+  if (raw === 'true' || raw === '1') return true
+  if (raw === 'false' || raw === '0') return false
+  throw new Error(`${name} must be true or false`)
+}
+
+/** `NAME_<CHAIN>` if that is set, else the chain-wide `NAME`, so one line can tune every chain. */
+function perChain(env: Env, name: string, suffix: string): string {
+  return env[`${name}_${suffix}`] ? `${name}_${suffix}` : name
 }
 
 function loadChain(env: Env, key: string): ChainConfig {
@@ -148,8 +191,12 @@ function loadChain(env: Env, key: string): ChainConfig {
     confirmations: BigInt(positiveInt(env, `CONFIRMATIONS_${suffix}`, defaults.confirmations)),
     minTopup,
     minTopupRaw: parseUnits(minTopup, defaults.decimals),
-    pollMs: defaults.pollMs,
-    logRange: BigInt(positiveInt(env, `LOG_RANGE_${suffix}`, 1000)),
+    pollMs: positiveInt(env, perChain(env, 'POLL_SECONDS', suffix), defaults.pollSeconds) * 1000,
+    // Ten blocks is the widest getLogs range free RPC plans allow (Alchemy's, for one).
+    logRange: BigInt(positiveInt(env, perChain(env, 'LOG_RANGE', suffix), 10)),
+    minBlockMs: positiveInt(env, `MIN_BLOCK_MS_${suffix}`, defaults.minBlockMs, { zero: true }),
+    multicall3: env[`MULTICALL3_ADDRESS_${suffix}`] ? address(env, `MULTICALL3_ADDRESS_${suffix}`) : MULTICALL3,
+    historicalReads: boolean(env, perChain(env, 'HISTORICAL_READS', suffix), true),
     rpcUrls: (env[`RPC_URLS_${suffix}`] ?? '').split(',').map((url) => url.trim()).filter(Boolean),
     maxGasPriceWei: maxGasPrice ? parseGwei(maxGasPrice) : undefined,
     explorerTx: defaults.explorerTx,
@@ -176,5 +223,9 @@ export function loadConfig(env: Env = process.env): Config {
     sweeperPrivateKey: sweeperKey as Hex | undefined,
     sweepIntervalMs: positiveInt(env, 'SWEEP_INTERVAL_SECONDS', 3600) * 1000,
     sweepBatchSize: positiveInt(env, 'SWEEP_BATCH_SIZE', 50),
+    invoiceTtlSeconds: positiveInt(env, 'INVOICE_TTL_SECONDS', 600),
+    lateWindowSeconds: positiveInt(env, 'LATE_PAYMENT_HOURS', 24, { zero: true }) * 3600,
+    latePassMs: positiveInt(env, 'LATE_PASS_SECONDS', 3600) * 1000,
+    multicallBatch: positiveInt(env, 'MULTICALL_BATCH', 500),
   }
 }

@@ -31,7 +31,7 @@ import { connect, migrate, type Sql } from '../src/db.ts'
 import { dispatchTick, verifySignature } from '../src/dispatcher.ts'
 import { factoryAbi } from '../src/forwarder.ts'
 import { sweepTick } from '../src/sweeper.ts'
-import { AddressBook, confirmTransfer, watcherTick } from '../src/watcher.ts'
+import { confirmTransfer, watcherTick } from '../src/watcher.ts'
 
 const RPC_URL = process.env.TEST_RPC_URL ?? 'http://127.0.0.1:8545'
 const PG_URL = process.env.TEST_PG_URL ?? 'postgres://aquipay:aquipay@127.0.0.1:54329'
@@ -83,6 +83,8 @@ interface InvoiceJson {
   reference: string
   address: Address
   checkout_url: string
+  created_at: string
+  expires_at: string
   networks: { chain: string; chain_id: number; min_amount: string; token_address: string }[]
   transfers: {
     chain: string
@@ -95,6 +97,12 @@ interface InvoiceJson {
   }[]
 }
 
+interface RpcCall {
+  id: number
+  method: string
+  params: unknown[]
+}
+
 describe('AquiPay', () => {
   let ctx: Context
   let chain: ChainConfig
@@ -103,7 +111,37 @@ describe('AquiPay', () => {
   let receiver: Server
   let receiverStatus = 204
   const received: { body: string; signature: string; eventId: string; payload: TopupEvent }[] = []
-  const book = new AddressBook()
+
+  // AquiPay reaches the chain through this proxy, which counts what it asks
+  // for and can answer in the chain's place to stand in for a failing provider.
+  let proxy: Server
+  const rpcCalls: RpcCall[] = []
+  let rpcFault: ((call: RpcCall) => object | undefined) | undefined
+  /** The RPC methods AquiPay called while `fn` ran. */
+  async function rpcMethods(fn: () => Promise<unknown>): Promise<string[]> {
+    const start = rpcCalls.length
+    await fn()
+    return rpcCalls.slice(start).map((call) => call.method)
+  }
+  /** Runs `fn` with `fault` answering the calls it matches. */
+  async function withFault<T>(fault: (call: RpcCall) => object | undefined, fn: () => Promise<T>): Promise<T> {
+    rpcFault = fault
+    try {
+      return await fn()
+    } finally {
+      rpcFault = undefined
+    }
+  }
+  const usdtCallTo = (call: RpcCall) =>
+    call.method === 'eth_call' && (call.params[0] as { to?: string }).to?.toLowerCase() === usdt.toLowerCase()
+
+  /** A context whose warnings and errors are kept, for the paths that only log. */
+  function recording(): { context: Context; warnings: object[]; errors: object[] } {
+    const warnings: object[] = []
+    const errors: object[] = []
+    const log = { info() {}, warn: (obj: object) => warnings.push(obj), error: (obj: object) => errors.push(obj) }
+    return { context: { ...ctx, log }, warnings, errors }
+  }
 
   const usdtBalance = (address: Address) =>
     chainClient.readContract({ address: usdt, abi: usdtAbi, functionName: 'balanceOf', args: [address] }) as Promise<bigint>
@@ -154,7 +192,13 @@ describe('AquiPay', () => {
   const statuses = async (id: string) => (await getInvoice(id)).transfers.map((t) => t.status)
   const eventsFor = (invoiceId: string) => received.map((r) => r.payload).filter((e) => e.data.invoice_id === invoiceId)
 
-  const tick = (variant: ChainConfig = chain) => watcherTick(ctx, variant, book)
+  const tick = (variant: ChainConfig = chain, options?: { late?: boolean }) => watcherTick(ctx, variant, options)
+  const latePass = () => tick(chain, { late: true })
+  /** Moves an invoice's expiry `seconds` into the past. */
+  const expire = (invoiceId: string, seconds: number) =>
+    ctx.sql`update invoices set expires_at = now() - make_interval(secs => ${seconds}) where id = ${invoiceId}`
+  /** Past the late-payment window, as if its last look came after the window closed: the watcher is done with it. */
+  const finish = (invoiceId: string) => expire(invoiceId, ctx.config.lateWindowSeconds + 86_400)
   const confirmBlocks = () => chainClient.mine({ blocks: Number(chain.confirmations) })
   /** Watcher pass, enough blocks to confirm, another pass. */
   async function settle() {
@@ -176,6 +220,8 @@ describe('AquiPay', () => {
     await chainClient.setAutomine(true)
     usdt = await deploy('MockUSDT', [6])
     const factory = await deploy('ForwarderFactory', [DESTINATION])
+    // Anvil has no Multicall3 of its own; deploying one elsewhere also exercises MULTICALL3_ADDRESS_<CHAIN>.
+    const multicall = await deploy('Multicall3', [])
     await mined(
       await deployer.writeContract({
         address: usdt,
@@ -202,6 +248,21 @@ describe('AquiPay', () => {
     })
     await new Promise<void>((resolve) => receiver.listen(0, '127.0.0.1', resolve))
 
+    proxy = createServer((req, res) => {
+      let body = ''
+      req.on('data', (chunk) => (body += chunk))
+      req.on('end', async () => {
+        const call = JSON.parse(body) as RpcCall
+        rpcCalls.push(call)
+        const fault = rpcFault?.(call)
+        const answer = fault
+          ? JSON.stringify({ jsonrpc: '2.0', id: call.id, ...fault })
+          : await (await fetch(RPC_URL, { method: 'POST', headers: { 'content-type': 'application/json' }, body })).text()
+        res.writeHead(200, { 'content-type': 'application/json' }).end(answer)
+      })
+    })
+    await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve))
+
     const config = loadConfig({
       DATABASE_URL: `${PG_URL}/${TEST_DB}`,
       PORT: '18473',
@@ -211,7 +272,8 @@ describe('AquiPay', () => {
       FORWARDER_FACTORY_ADDRESS: factory,
       CHAINS: 'local',
       USDT_ADDRESS_LOCAL: usdt,
-      RPC_URLS_LOCAL: RPC_URL,
+      RPC_URLS_LOCAL: `http://127.0.0.1:${(proxy.address() as AddressInfo).port}`,
+      MULTICALL3_ADDRESS_LOCAL: multicall,
       CONFIRMATIONS_LOCAL: '5',
       SWEEPER_PRIVATE_KEY: SWEEPER_KEY,
     })
@@ -226,23 +288,63 @@ describe('AquiPay', () => {
     await app?.close()
     await ctx?.sql.end()
     receiver?.close()
+    proxy?.close()
   })
 
   describe('database', () => {
     it('applies migrations once and is a no-op afterwards', async () => {
-      expect(await migrate(ctx.sql)).toEqual(['001_init.sql', '002_credit_event.sql'])
+      const all = ['001_init.sql', '002_credit_event.sql', '003_expiry_and_balances.sql']
+      expect(await migrate(ctx.sql)).toEqual(all)
       expect(await migrate(ctx.sql)).toEqual([])
       const names = await ctx.sql`select name from schema_migrations order by name`
-      expect(names.map((row) => row.name)).toEqual(['001_init.sql', '002_credit_event.sql'])
+      expect(names.map((row) => row.name)).toEqual(all)
     })
   })
 
-  describe('watcher bookkeeping', () => {
-    it('advances the cursor when there is nothing to watch', async () => {
+  // What fits a free RPC plan: nothing while no checkout is open, two calls a
+  // pass however many are, and a handful more for each payment.
+  describe('RPC budget', () => {
+    it('makes no call at all while no checkout is open and nothing is confirming', async () => {
+      expect(await rpcMethods(() => tick())).toEqual([])
+      expect(await rpcMethods(() => tick())).toEqual([])
+    })
+
+    it('reads every open checkout in one call', async () => {
+      await createInvoice('budget-one')
+      expect(await rpcMethods(() => tick())).toEqual(['eth_blockNumber', 'eth_call'])
+      const many = await Promise.all(Array.from({ length: 300 }, (_, i) => createInvoice(`budget-${i}`)))
+      expect(await rpcMethods(() => tick())).toEqual(['eth_blockNumber', 'eth_call'])
+      // MULTICALL_BATCH addresses per call.
+      const small = (context: Context) => watcherTick(context, chain)
+      expect(await rpcMethods(() => small(withConfig({ multicallBatch: 100 })))).toEqual([
+        'eth_blockNumber',
+        'eth_call',
+        'eth_call',
+        'eth_call',
+        'eth_call',
+      ])
+
+      // Each address gets one more look after it expires, then none.
+      await ctx.sql`update invoices set expires_at = now() where id in ${ctx.sql(many.map((i) => i.id))} or reference = 'budget-one'`
+      expect(await rpcMethods(() => tick())).toEqual(['eth_blockNumber', 'eth_call'])
+      expect(await rpcMethods(() => tick())).toEqual([])
+    })
+
+    it('spends a few calls and one log query on a payment', async () => {
+      const invoice = await createInvoice('budget-payment')
       await tick()
-      const [cursor] = await ctx.sql`select block_number from chain_cursors where chain = 'local'`
-      expect(cursor!.block_number).toBe(await chainClient.getBlockNumber({ cacheTime: 0 }))
-      expect(await ctx.sql`select 1 from transfers`).toHaveLength(0)
+      await pay(invoice.address, '10')
+      const methods = await rpcMethods(() => tick())
+      expect(methods.filter((m) => m === 'eth_getLogs')).toHaveLength(1)
+      expect(methods.length).toBeLessThanOrEqual(6)
+      expect(await statuses(invoice.id)).toEqual(['pending'])
+
+      // Confirming goes on after the address stops being read: the tip, then the block's hash.
+      await expire(invoice.id, 1)
+      await confirmBlocks()
+      expect(await rpcMethods(() => tick())).toEqual(['eth_blockNumber', 'eth_getBlockByNumber'])
+      expect(await statuses(invoice.id)).toEqual(['confirmed'])
+      expect(await rpcMethods(() => tick())).toEqual([])
     })
   })
 
@@ -281,6 +383,16 @@ describe('AquiPay', () => {
       })
       expect(invoice.address).toMatch(/^0x[0-9a-fA-F]{40}$/)
       expect((await createInvoice('order-1')).address).not.toBe(invoice.address)
+      // Live for INVOICE_TTL_SECONDS.
+      expect(Date.parse(invoice.expires_at) - Date.parse(invoice.created_at)).toBe(600_000)
+      expect((await getInvoice(invoice.id)).expires_at).toBe(invoice.expires_at)
+    })
+
+    it('makes invoices live for as long as INVOICE_TTL_SECONDS says', async () => {
+      const short = buildServer(withConfig({ invoiceTtlSeconds: 30 }))
+      const invoice = (await short.inject({ method: 'POST', url: '/v1/invoices', headers: AUTH, payload: { reference: 'ttl' } })).json()
+      expect(Date.parse(invoice.expires_at) - Date.parse(invoice.created_at)).toBe(30_000)
+      await short.close()
     })
 
     it('defaults metadata to an empty object', async () => {
@@ -378,7 +490,20 @@ describe('AquiPay', () => {
       const again = await app.inject({ url: `/checkout/${invoice.id}` })
       expect(again.headers['content-security-policy']).not.toBe(csp)
 
-      expect((await app.inject({ url: `/checkout/${invoice.id}/status` })).json()).toEqual({ transfers: [] })
+      expect((await app.inject({ url: `/checkout/${invoice.id}/status` })).json()).toEqual({ expired: false, transfers: [] })
+      expect(page.body).toMatch(/id="clock" role="timer">(10:00|9:5\d)</)
+    })
+
+    it('stops showing the address once the invoice has expired', async () => {
+      const invoice = await createInvoice('checkout-expired')
+      await expire(invoice.id, 1)
+      const page = await app.inject({ url: `/checkout/${invoice.id}` })
+      expect(page.statusCode).toBe(200)
+      expect(page.body).toContain("This address has expired. Don't send to it.")
+      expect(page.body).not.toContain(`aria-label="${invoice.address}"`)
+      expect((await app.inject({ url: `/checkout/${invoice.id}/status` })).json()).toEqual({ expired: true, transfers: [] })
+      // A status poll for an id that is not an invoice says so the same way.
+      expect((await app.inject({ url: `/checkout/${randomUUID()}/status` })).json()).toEqual({ expired: true, transfers: [] })
     })
 
     it('shows the not-found page for an unknown or malformed link', async () => {
@@ -424,6 +549,7 @@ describe('AquiPay', () => {
         transfers: [{ chain: 'local', tx_hash: topupTx, amount: '25.5', status: 'pending', credited: false }],
       })
       expect((await app.inject({ url: `/checkout/${invoice.id}/status` })).json()).toEqual({
+        expired: false,
         transfers: [{ chain: 'local', tx_hash: topupTx, amount: '25.5', status: 'pending', credited: false }],
       })
       await drainWebhooks()
@@ -461,6 +587,9 @@ describe('AquiPay', () => {
         },
       })
 
+      // Swept once the watcher is done with the address.
+      expect(await sweepTick(ctx, chain)).toBeUndefined()
+      await finish(invoice.id)
       const sweepTx = await sweepTick(ctx, chain)
       expect(sweepTx).toMatch(/^0x[0-9a-f]{64}$/)
       expect(await usdtBalance(DESTINATION)).toBe(destinationBefore + parseUnits('25.5', 6))
@@ -469,14 +598,56 @@ describe('AquiPay', () => {
       expect(swept.transfers[0]).toMatchObject({ swept_tx_hash: sweepTx })
       expect(swept.transfers[0]!.swept_at).not.toBeNull()
       expect(await sweepTick(ctx, chain)).toBeUndefined()
+    })
 
-      // The address keeps working after its forwarder is deployed.
-      await pay(invoice.address, '12')
-      await settle()
+    it('credits a payment that lands after expiry, within the late window, on the hourly pass', async () => {
+      const invoice = await createInvoice('late-payment')
+      await tick()
+      await expire(invoice.id, 3600)
+      await pay(invoice.address, '14')
+
+      // An ordinary pass no longer reads the address...
+      await tick()
+      expect(await statuses(invoice.id)).toEqual([])
+      // ...the late pass does.
+      await latePass()
+      expect(await statuses(invoice.id)).toEqual(['pending'])
+      await confirmBlocks()
+      await tick()
+      await latePass()
       await drainWebhooks()
-      expect(eventsFor(invoice.id).map((e) => e.data.amount)).toEqual(['25.5', '12'])
+      expect(eventsFor(invoice.id).map((e) => e.data.amount)).toEqual(['14'])
+    })
+
+    it('credits a payment once that both the last look and the late pass see', async () => {
+      const invoice = await createInvoice('seen-twice')
+      await pay(invoice.address, '16')
+      await tick()
+      await expire(invoice.id, 0)
+      await confirmBlocks()
+      await tick()
+      await latePass()
+      await latePass()
+      await drainWebhooks()
+      expect(eventsFor(invoice.id).map((e) => e.data.amount)).toEqual(['16'])
+      expect(await statuses(invoice.id)).toEqual(['confirmed'])
+    })
+
+    it('neither credits nor sweeps a payment that arrives after the late window', async () => {
+      const invoice = await createInvoice('too-late')
+      await tick()
+      await finish(invoice.id)
+      await pay(invoice.address, '13')
+      await tick()
+      await latePass()
+      await confirmBlocks()
+      await latePass()
+      await drainWebhooks()
+      expect(await statuses(invoice.id)).toEqual([])
+      expect(eventsFor(invoice.id)).toHaveLength(0)
+      // Left at the address, for a refund by hand.
       await sweepTick(ctx, chain)
-      expect(await usdtBalance(DESTINATION)).toBe(destinationBefore + parseUnits('37.5', 6))
+      expect(await usdtBalance(invoice.address)).toBe(parseUnits('13', 6))
     })
 
     it('credits 4 USDT followed by 30 USDT as one top-up of 34', async () => {
@@ -570,6 +741,13 @@ describe('AquiPay', () => {
 
     it('ignores zero-value transfers and transfers of other tokens', async () => {
       const invoice = await createInvoice('noise')
+      await tick()
+      // Searched alongside a real one, the zero-value transfer is skipped.
+      await pay(invoice.address, '0')
+      const real = await pay(invoice.address, '2')
+      await tick()
+      expect((await getInvoice(invoice.id)).transfers.map((t) => t.tx_hash)).toEqual([real])
+      await ctx.sql`delete from transfers where invoice_id = ${invoice.id}`
       await pay(invoice.address, '0')
       const fakeUsdt = await deploy('MockUSDT', [6])
       await mined(
@@ -586,6 +764,34 @@ describe('AquiPay', () => {
       expect(eventsFor(invoice.id)).toHaveLength(0)
     })
 
+    it('searches from the first block and confirms nothing on a chain shorter than the confirmation depth', async () => {
+      // A token of its own, so only what this test sends is there to find.
+      const young: ChainConfig = {
+        ...chain,
+        key: 'local-young',
+        usdt: await deploy('MockUSDT', [6]),
+        confirmations: 10n ** 12n,
+        logRange: 10n ** 9n,
+      }
+      const invoice = await createInvoice('young-chain')
+      await tick(young)
+      await mined(
+        await deployer.writeContract({
+          address: young.usdt,
+          abi: usdtAbi,
+          functionName: 'mint',
+          args: [invoice.address, parseUnits('20', 6)],
+        }),
+      )
+      // The search starts at block 0, where the token did not exist yet; its logs are read instead.
+      const { context, warnings } = recording()
+      await watcherTick(context, young)
+      expect(warnings).toHaveLength(1)
+      const rows = await ctx.sql`select status from transfers where chain = 'local-young'`
+      expect(rows.map((row) => row.status)).toEqual(['pending'])
+      await ctx.sql`delete from transfers where chain = 'local-young'`
+    })
+
     it('finds payments when the block range is scanned in small pieces', async () => {
       const invoice = await createInvoice('small-ranges')
       await pay(invoice.address, '11')
@@ -594,18 +800,102 @@ describe('AquiPay', () => {
       expect(await statuses(invoice.id)).toEqual(['confirmed'])
     })
 
-    it('scans from the first block and confirms nothing on a chain shorter than the confirmation depth', async () => {
-      // A separate token and cursor, so this scan of the whole chain adds no transfers.
-      const young: ChainConfig = {
-        ...chain,
-        key: 'local-young',
-        usdt: await deploy('MockUSDT', [6]),
-        confirmations: 10n ** 12n,
-      }
-      await tick(young)
-      const [cursor] = await ctx.sql`select block_number from chain_cursors where chain = 'local-young'`
-      expect(cursor!.block_number).toBe(await chainClient.getBlockNumber({ cacheTime: 0 }))
-      expect(await ctx.sql`select 1 from transfers where chain = 'local-young'`).toHaveLength(0)
+    it('searches a new address back to before its invoice existed', async () => {
+      // The first look at an address reaches back the invoice's age in blocks,
+      // at MIN_BLOCK_MS a block, plus the confirmation depth.
+      const invoice = await createInvoice('first-look')
+      await pay(invoice.address, '12')
+      await chainClient.mine({ blocks: 40 })
+      const slowBlocks: ChainConfig = { ...chain, minBlockMs: 60_000 }
+
+      // Guessing blocks too slow would look back too little; the payment is
+      // not found, so the balance is not taken as accounted for.
+      const { context, errors } = recording()
+      await watcherTick(context, slowBlocks)
+      expect(errors).toEqual([expect.objectContaining({ invoiceId: invoice.id })])
+      expect(String((errors[0] as { err: Error }).err.message)).toMatch(/found 0 of the 12000000/)
+      expect(await statuses(invoice.id)).toEqual([])
+      const [state] = await ctx.sql`select 1 from watch_state where invoice_id = ${invoice.id}`
+      expect(state).toBeUndefined()
+
+      // A fast enough bound reaches it.
+      await tick({ ...chain, minBlockMs: 1 })
+      expect(await statuses(invoice.id)).toEqual(['confirmed'])
+    })
+
+    it('records a payment once though the next search covers its block again', async () => {
+      // Each search reaches back the confirmation depth past the last look.
+      const invoice = await createInvoice('covered-twice')
+      await tick()
+      const first = await pay(invoice.address, '3')
+      await tick()
+      const second = await pay(invoice.address, '8')
+      await tick()
+      expect((await getInvoice(invoice.id)).transfers.map((t) => t.tx_hash)).toEqual([first, second])
+    })
+
+    it('finds two payments made far apart between two passes', async () => {
+      const invoice = await createInvoice('two-apart')
+      await tick()
+      const first = await pay(invoice.address, '6')
+      await chainClient.mine({ blocks: 50 })
+      const second = await pay(invoice.address, '7')
+      await chainClient.mine({ blocks: 50 })
+      await tick()
+      await drainWebhooks()
+      expect(eventsFor(invoice.id)[0]!.data).toMatchObject({ amount: '13', transfers: [{ tx_hash: first }, { tx_hash: second }] })
+    })
+
+    it('reads the logs instead when the RPC refuses past balances', async () => {
+      const invoice = await createInvoice('no-history')
+      await tick()
+      await pay(invoice.address, '17')
+      await chainClient.mine({ blocks: 30 })
+      const { context, warnings } = recording()
+      const methods = await withFault(
+        (call) => (usdtCallTo(call) ? { error: { code: -32000, message: 'missing trie node' } } : undefined),
+        () => rpcMethods(() => watcherTick(context, chain)),
+      )
+      expect(warnings.length).toBeGreaterThan(0)
+      // The 36 or so blocks since the last look, ten at a time.
+      expect(methods.filter((m) => m === 'eth_getLogs').length).toBeGreaterThanOrEqual(4)
+      expect(await statuses(invoice.id)).toEqual(['confirmed'])
+    })
+
+    it('reads only logs when HISTORICAL_READS is off', async () => {
+      const invoice = await createInvoice('history-off')
+      const noHistory: ChainConfig = { ...chain, historicalReads: false }
+      await tick(noHistory)
+      await pay(invoice.address, '18')
+      await chainClient.mine({ blocks: 30 })
+      const methods = await rpcMethods(() => tick(noHistory))
+      // The multicall at the tip is the only eth_call: no balance is read in the past.
+      expect(methods.filter((m) => m === 'eth_call')).toHaveLength(1)
+      expect(await statuses(invoice.id)).toEqual(['confirmed'])
+
+      // And after a reorg asked for a fresh search, with no baseline at all.
+      await ctx.sql`update watch_state set balance = null where invoice_id = ${invoice.id}`
+      await tick(noHistory)
+      expect(await statuses(invoice.id)).toEqual(['confirmed'])
+      const [state] = await ctx.sql`select balance::text from watch_state where invoice_id = ${invoice.id}`
+      expect(state!.balance).toBe('18000000')
+    })
+
+    it('does not take a balance as accounted for when the logs come back short', async () => {
+      const invoice = await createInvoice('short-logs')
+      await tick()
+      await pay(invoice.address, '19')
+      const { context, errors } = recording()
+      // A node behind the one that answered the balance.
+      await withFault(
+        (call) => (call.method === 'eth_getLogs' ? { result: [] } : undefined),
+        () => watcherTick(context, chain),
+      )
+      expect(errors).toHaveLength(1)
+      expect(await statuses(invoice.id)).toEqual([])
+      // The next pass searches the same blocks again and finds it.
+      await tick()
+      expect(await statuses(invoice.id)).toEqual(['pending'])
     })
 
     it('picks up a payment made while the watcher was not running', async () => {
@@ -672,7 +962,11 @@ describe('AquiPay', () => {
 
       expect(await statuses(invoice.id)).toEqual(['orphaned'])
       // The customer no longer sees it.
-      expect((await app.inject({ url: `/checkout/${invoice.id}/status` })).json()).toEqual({ transfers: [] })
+      expect((await app.inject({ url: `/checkout/${invoice.id}/status` })).json()).toEqual({ expired: false, transfers: [] })
+      // The address is searched again, finds nothing, and is settled at nothing.
+      await tick()
+      const [state] = await ctx.sql`select balance::text from watch_state where invoice_id = ${invoice.id}`
+      expect(state!.balance).toBe('0')
       await drainWebhooks()
       expect(eventsFor(invoice.id)).toHaveLength(0)
       // Nor is it ever treated as swept.
@@ -704,6 +998,20 @@ describe('AquiPay', () => {
       expect(eventsFor(invoice.id).map((e) => e.data.amount)).toEqual(['18'])
     })
 
+    it('finds a payment that a reorg put under the last look', async () => {
+      const invoice = await createInvoice('reorg-under')
+      const snapshot = await chainClient.snapshot()
+      await chainClient.mine({ blocks: 3 })
+      await tick()
+
+      // The blocks the last look saw are replaced by ones holding a payment.
+      await chainClient.revert({ id: snapshot })
+      const hash = await pay(invoice.address, '9')
+      await chainClient.mine({ blocks: 2 })
+      await tick()
+      expect((await getInvoice(invoice.id)).transfers).toMatchObject([{ tx_hash: hash }])
+    })
+
     it('follows a pending transfer that moves to a different block', async () => {
       const invoice = await createInvoice('reorg-moved')
       const snapshot = await chainClient.snapshot()
@@ -715,15 +1023,18 @@ describe('AquiPay', () => {
       await chainClient.revert({ id: snapshot })
       await chainClient.mine({ blocks: 1 })
       await broadcast(raw)
+      // Same balance, so nothing looks different until the old block is deep
+      // enough to check: then the transfer is orphaned and the address searched again.
+      await tick()
+      await confirmBlocks()
+      await tick()
+      expect(await statuses(invoice.id)).toEqual(['orphaned'])
       await tick()
 
       const [after] = await ctx.sql`select block_number, block_hash, status from transfers where tx_hash = ${hash}`
-      expect(after!.status).toBe('pending')
+      expect(after!.status).toBe('confirmed')
       expect(after!.block_number).toBe((before!.block_number as bigint) + 1n)
       expect(after!.block_hash).not.toBe(before!.block_hash)
-
-      await confirmBlocks()
-      await tick()
       await drainWebhooks()
       expect(await ctx.sql`select 1 from transfers where invoice_id = ${invoice.id}`).toHaveLength(1)
       expect(eventsFor(invoice.id).map((e) => e.data.amount)).toEqual(['19'])
@@ -804,6 +1115,7 @@ describe('AquiPay', () => {
       const invoice = await createInvoice(reference)
       await pay(invoice.address, amount)
       await settle()
+      await finish(invoice.id)
       return invoice
     }
 
@@ -850,26 +1162,42 @@ describe('AquiPay', () => {
       expect(await sweepTick(oneAtATime, chain)).toBeUndefined()
     })
 
-    it('leaves a payment that arrives after the sweep for the next pass', async () => {
-      const invoice = await confirmedInvoice('late-arrival', '10')
-      await pay(invoice.address, '11')
-      await tick() // detected but not yet confirmed
-      const first = await sweepTick(ctx, chain)
-      // The sweep moved both, but only the confirmed transfer is marked.
-      expect(await usdtBalance(invoice.address)).toBe(0n)
-      const rows = await ctx.sql`select status, swept_tx_hash from transfers where invoice_id = ${invoice.id} order by id`
-      expect(rows.map((row) => [row.status, row.swept_tx_hash])).toEqual([
-        ['confirmed', first],
-        ['pending', null],
-      ])
+    it('leaves an address alone while the watcher still reads it', async () => {
+      // Emptying a watched address could hide a payment that lands in the same
+      // pass: the balance would read as before, and the watcher would look no further.
+      const invoice = await createInvoice('still-watched')
+      await pay(invoice.address, '10')
+      await settle()
+      expect(await sweepTick(ctx, chain)).toBeUndefined()
+
+      // A later payment is still found, as the address was not emptied.
+      const later = await pay(invoice.address, '11')
+      await expire(invoice.id, 3600)
+      expect(await sweepTick(ctx, chain)).toBeUndefined()
+      await latePass()
       await confirmBlocks()
       await tick()
-      // Already empty on chain, so it is marked without another transaction.
+      await drainWebhooks()
+      expect(eventsFor(invoice.id).map((e) => e.data.transfers.map((t) => t.tx_hash))).toEqual([
+        [expect.any(String)],
+        [later],
+      ])
+      expect(await usdtBalance(invoice.address)).toBe(parseUnits('21', 6))
+
+      // Once it is done with the address, both go in one sweep.
+      await finish(invoice.id)
+      const sweepTx = await sweepTick(ctx, chain)
+      expect(await usdtBalance(invoice.address)).toBe(0n)
+      const rows = await ctx.sql`select swept_tx_hash from transfers where invoice_id = ${invoice.id}`
+      expect(rows.map((row) => row.swept_tx_hash)).toEqual([sweepTx, sweepTx])
+    })
+
+    it("waits for a reorg's search again before sweeping", async () => {
+      const invoice = await confirmedInvoice('recheck-pending', '10')
+      await ctx.sql`update watch_state set balance = null where invoice_id = ${invoice.id}`
       expect(await sweepTick(ctx, chain)).toBeUndefined()
-      const [late] = await ctx.sql`
-        select swept_at, swept_tx_hash from transfers where invoice_id = ${invoice.id} order by id desc limit 1`
-      expect(late!.swept_at).not.toBeNull()
-      expect(late!.swept_tx_hash).toBeNull()
+      await latePass()
+      expect(await sweepTick(ctx, chain)).toBeDefined()
     })
 
     it('marks an address someone else already flushed, and sweeps the rest', async () => {
@@ -891,6 +1219,15 @@ describe('AquiPay', () => {
       const marked = await transferRow(flushed.id)
       expect(marked.swept_at).not.toBeNull()
       expect(marked.swept_tx_hash).toBeNull()
+
+      // When every address in the batch was flushed already, no transaction is sent.
+      const alone = await confirmedInvoice('flushed-alone', '10')
+      const [salt] = await ctx.sql<{ salt: Hex }[]>`select salt from invoices where id = ${alone.id}`
+      await mined(
+        await deployer.writeContract({ address: ctx.config.factory, abi: factoryAbi, functionName: 'sweep', args: [usdt, [salt!.salt]] }),
+      )
+      expect(await sweepTick(ctx, chain)).toBeUndefined()
+      expect((await transferRow(alone.id)).swept_at).not.toBeNull()
     })
 
     it('parks a frozen address without blocking the rest of the batch', async () => {
@@ -910,6 +1247,8 @@ describe('AquiPay', () => {
         )
       await setFrozen(true)
       await settle()
+      await finish(frozen.id)
+      await finish(healthy.id)
 
       const sweepTx = await sweepTick(ctx, chain)
       expect(await usdtBalance(DESTINATION)).toBe(destinationBefore + parseUnits('20', 6))
@@ -980,7 +1319,7 @@ describe('AquiPay', () => {
 
     it('all runs every role together: detect, confirm, notify and sweep', async () => {
       const shutdown = new AbortController()
-      const running = run('all', withConfig({ sweepIntervalMs: 200 }), shutdown.signal)
+      const running = run('all', withConfig({ sweepIntervalMs: 200, lateWindowSeconds: 0 }), shutdown.signal)
       try {
         await waitFor(
           () => fetch('http://127.0.0.1:18473/readyz').then((r) => r.ok, () => false),
@@ -995,6 +1334,9 @@ describe('AquiPay', () => {
         await pay(invoice.address, '21')
         await confirmBlocks()
         await waitFor(async () => eventsFor(invoice.id).length === 1, 'the webhook')
+        // With no late window, the look after expiry is the last, and the sweep follows.
+        expect(await usdtBalance(invoice.address)).toBe(parseUnits('21', 6))
+        await expire(invoice.id, 0)
         await waitFor(async () => (await usdtBalance(invoice.address)) === 0n, 'the sweep')
         await waitFor(async () => (await getInvoice(invoice.id)).transfers[0]!.swept_at !== null, 'the sweep to be recorded')
         expect(eventsFor(invoice.id)[0]!.data.amount).toBe('21')
