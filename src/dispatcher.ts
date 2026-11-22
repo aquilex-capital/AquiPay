@@ -52,7 +52,7 @@ export async function dispatchTick(ctx: Context): Promise<number> {
         })
         if (!response.ok) error = `HTTP ${response.status}`
       } catch (err) {
-        error = err instanceof Error ? err.message : String(err)
+        error = String(err)
       }
       if (error) {
         const attempts = delivery.attempts + 1

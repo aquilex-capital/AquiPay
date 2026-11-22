@@ -51,9 +51,14 @@ npm run dev                        # all roles in one process, applies migration
 Tests:
 
 ```sh
-npm run contracts:test   # Solidity unit tests
-npm test                 # end-to-end: invoice -> payment -> webhook -> sweep, reorg, frozen address
+npm run contracts:test      # Solidity unit tests
+npm test                    # unit tests, plus end-to-end tests against the local chain and database
+npm run test:coverage       # the same, failing if coverage of src/ drops below 100%
+npm run contracts:coverage  # Solidity coverage report
 ```
+
+`src/main.ts` is excluded from the coverage figure: it is process wiring, and
+the tests run it as a child process, which in-process coverage cannot see.
 
 ## API
 
@@ -106,10 +111,13 @@ All `/v1/*` requests need `Authorization: Bearer $API_KEY`.
    same on every chain as long as `DESTINATION` is the same.
 
    ```sh
-   docker run --rm -it -v "$PWD":/repo -w /repo/contracts \
+   docker run --rm -it -v "$PWD":/repo -w /repo \
      -e DESTINATION=0xYourWallet --entrypoint forge ghcr.io/foundry-rs/foundry:stable \
-     script script/Deploy.s.sol --rpc-url <RPC_URL> --private-key <FUNDED_KEY> --broadcast
+     script contracts/script/Deploy.s.sol --rpc-url <RPC_URL> --private-key <FUNDED_KEY> --broadcast
    ```
+
+   Running it a second time on the same chain with the same `DESTINATION`
+   reverts, because the factory already exists at that address.
 
 2. **Create a sweeper key** and fund it with a little native token on each
    chain (ETH, BNB, POL).

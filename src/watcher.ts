@@ -121,7 +121,7 @@ async function settlePending(ctx: Context, chain: ChainConfig, latest: bigint): 
       ctx.log.warn({ chain: chain.key, transferId: row.id }, 'transfer orphaned by reorg')
       continue
     }
-    await confirm(ctx, chain, row)
+    await confirmTransfer(ctx, chain, row)
   }
 }
 
@@ -139,7 +139,7 @@ interface UncreditedRow {
  * this chain together if they now add up to the minimum. Small payments
  * therefore accumulate instead of being lost.
  */
-async function confirm(ctx: Context, chain: ChainConfig, row: PendingRow): Promise<void> {
+export async function confirmTransfer(ctx: Context, chain: ChainConfig, row: Pick<PendingRow, 'id'>): Promise<void> {
   await ctx.sql.begin(async (tx) => {
     // The status guard makes confirmation, and so the webhook, happen exactly once.
     const [transfer] = await tx`

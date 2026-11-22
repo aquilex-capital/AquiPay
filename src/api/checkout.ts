@@ -221,7 +221,7 @@ ${script}
 
 /** "0x" followed by ten groups of four; the first and last groups are what people verify. */
 function groupedAddress(address: string): string {
-  const groups = address.slice(2).match(/.{4}/g) ?? []
+  const groups = Array.from({ length: 10 }, (_, i) => address.slice(2 + i * 4, 6 + i * 4))
   const spans = groups.map((group, i) => {
     const edge = i === 0 || i === groups.length - 1
     return `<span${edge ? ' class="edge"' : ''}>${escapeHtml(group)}</span>`

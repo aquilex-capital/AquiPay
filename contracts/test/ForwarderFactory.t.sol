@@ -100,6 +100,92 @@ contract ForwarderFactoryTest is Test {
         assertEq(DEST.balance, 1 ether);
     }
 
+    function test_flushWithNothingToSendIsANoOp() public {
+        bytes32[] memory salts = _salts(1);
+        address forwarder = factory.forwarderAddress(salts[0]);
+        factory.sweep(IERC20(address(usdt)), salts);
+
+        Forwarder(forwarder).flush(IERC20(address(usdt)));
+        Forwarder(forwarder).flushNative();
+
+        assertEq(usdt.balanceOf(DEST), 0);
+        assertEq(DEST.balance, 0);
+    }
+
+    function test_flushNativeRevertsWhenDestinationRejectsEther() public {
+        // A destination with no receive function, such as a token contract.
+        ForwarderFactory rejecting = new ForwarderFactory(address(usdt));
+        bytes32[] memory salts = _salts(1);
+        address forwarder = rejecting.forwarderAddress(salts[0]);
+        vm.deal(forwarder, 1 ether);
+        rejecting.sweep(IERC20(address(usdt)), salts);
+
+        vm.expectRevert(Forwarder.NativeTransferFailed.selector);
+        Forwarder(forwarder).flushNative();
+        assertEq(forwarder.balance, 1 ether);
+    }
+
+    function test_sweepEmitsDeploymentOnceAndFlushFailures() public {
+        bytes32[] memory salts = _salts(1);
+        address forwarder = _pay(salts[0], 10e6);
+
+        vm.expectEmit(true, true, false, false, address(factory));
+        emit ForwarderFactory.ForwarderDeployed(forwarder, salts[0]);
+        factory.sweep(IERC20(address(usdt)), salts);
+
+        _pay(salts[0], 10e6);
+        usdt.setFrozen(forwarder, true);
+        vm.expectEmit(true, true, false, false, address(factory));
+        emit ForwarderFactory.FlushFailed(forwarder, salts[0]);
+        factory.sweep(IERC20(address(usdt)), salts);
+    }
+
+    function test_sweepOfEmptyBatchDoesNothing() public {
+        factory.sweep(IERC20(address(usdt)), new bytes32[](0));
+        assertEq(usdt.balanceOf(DEST), 0);
+    }
+
+    function test_addressesDependOnFactoryAndSaltOnly() public {
+        bytes32[] memory salts = _salts(2);
+        address first = factory.forwarderAddress(salts[0]);
+        assertTrue(first != factory.forwarderAddress(salts[1]));
+
+        // The same factory address gives the same invoice address on any chain.
+        vm.chainId(42161);
+        assertEq(factory.forwarderAddress(salts[0]), first);
+
+        ForwarderFactory other = new ForwarderFactory(DEST);
+        assertTrue(other.forwarderAddress(salts[0]) != first);
+    }
+
+    function test_proposalCanBeReplacedAndIsClearedOnAccept() public {
+        address wrong = address(0xBAD1);
+        address right = address(0xD359);
+
+        vm.expectEmit(true, true, false, false, address(factory));
+        emit ForwarderFactory.DestinationProposed(DEST, wrong);
+        vm.prank(DEST);
+        factory.proposeDestination(wrong);
+        vm.prank(DEST);
+        factory.proposeDestination(right);
+        assertEq(factory.pendingDestination(), right);
+
+        vm.prank(wrong);
+        vm.expectRevert(ForwarderFactory.NotPendingDestination.selector);
+        factory.acceptDestination();
+
+        vm.expectEmit(true, true, false, false, address(factory));
+        emit ForwarderFactory.DestinationChanged(DEST, right);
+        vm.prank(right);
+        factory.acceptDestination();
+        assertEq(factory.pendingDestination(), address(0));
+
+        // The old wallet has no power left.
+        vm.prank(DEST);
+        vm.expectRevert(ForwarderFactory.NotDestination.selector);
+        factory.proposeDestination(DEST);
+    }
+
     function test_destinationChangeNeedsBothWallets() public {
         address next = address(0xD358);
 
