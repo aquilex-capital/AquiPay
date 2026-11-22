@@ -4,7 +4,7 @@ import type { Context } from './context.ts'
 import { migrate } from './db.ts'
 import { dispatchTick } from './dispatcher.ts'
 import { sweepTick } from './sweeper.ts'
-import { AddressBook, watcherTick } from './watcher.ts'
+import { watcherTick } from './watcher.ts'
 
 export const ROLES = ['api', 'watcher', 'dispatcher', 'sweeper', 'migrate', 'all'] as const
 export type Role = (typeof ROLES)[number]
@@ -48,8 +48,15 @@ export async function run(role: Role, ctx: Context, signal: AbortSignal): Promis
 
   if (runs('watcher')) {
     for (const chain of config.chains) {
-      const book = new AddressBook()
-      tasks.push(loop(ctx, `watcher:${chain.key}`, chain.pollMs, signal, () => watcherTick(ctx, chain, book)))
+      // The late-payment pass rides on an ordinary pass, so the two never race over one address.
+      let lateDue = 0
+      tasks.push(
+        loop(ctx, `watcher:${chain.key}`, chain.pollMs, signal, async () => {
+          const late = Date.now() >= lateDue
+          await watcherTick(ctx, chain, { late })
+          if (late) lateDue = Date.now() + config.latePassMs
+        }),
+      )
     }
   }
   if (runs('dispatcher')) {

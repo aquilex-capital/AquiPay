@@ -44,6 +44,7 @@ Response, `201 Created`:
   "address": "0xf3ed68Da02C53c64c4cf880D254A8442d4535638",
   "checkout_url": "https://pay.example.com/checkout/e01ae86c-9266-4bf7-b1ee-7a503f92de66",
   "created_at": "2026-11-22T07:58:19.092Z",
+  "expires_at": "2026-11-22T08:08:19.092Z",
   "networks": [
     { "chain": "arbitrum", "chain_id": 42161, "name": "Arbitrum One",
       "token_address": "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9", "min_amount": "10" }
@@ -55,12 +56,20 @@ Response, `201 Created`:
 Create a new invoice for each top-up a user starts. Store the `id` next to your
 own record if you want to look the invoice up later.
 
+The address is live until `expires_at`, ten minutes after creation unless the
+gateway sets `INVOICE_TTL_SECONDS`. Don't show it after that: start a new
+invoice instead. A payment that lands after `expires_at` is still credited if
+it lands within `LATE_PAYMENT_HOURS` (24) of it, on an hourly pass; one that
+lands later is not seen at all.
+
 ## 2. Show the user where to pay
 
 Pick one:
 
 - **Hosted page.** Redirect the user to `checkout_url`. It shows the network
-  picker, the address, a QR code and live payment status. Nothing else to build.
+  picker, the address, a QR code, how long the address stays live and live
+  payment status. Once the invoice expires, it stops showing the address and
+  says to start again from where the user came. Nothing else to build.
 - **Your own UI.** Show `address` and let the user choose from `networks`. Tell
   them to send only USDT, only on the network they chose, and show that
   network's `min_amount`.
@@ -156,8 +165,8 @@ starting at 30 seconds and capped at 6 hours.
   decimal type or convert to integer micro-units. Do not use floating point for
   balances.
 - **One invoice can produce several events.** Every time the uncredited
-  payments to an address reach the minimum, you get another `topup.confirmed`.
-  Addresses do not expire.
+  payments to an address reach the minimum, you get another `topup.confirmed`,
+  until the address stops being read.
 - **Small payments accumulate.** A transfer below the minimum is not credited
   on its own. It waits, per invoice and per network, and is included in the next
   event once the waiting total reaches the minimum. That is why `transfers` can
@@ -211,6 +220,9 @@ List endpoints return `{"data": [...]}` and accept `limit` (default 50, maximum 
      --rpc-url http://localhost:8545
    docker compose exec -T anvil cast rpc anvil_mine 0x5 --rpc-url http://localhost:8545
    ```
+
+   Pay within the invoice's ten minutes, or set `INVOICE_TTL_SECONDS` higher
+   for testing.
 
    `25000000` is 25 USDT (6 decimals). The receiver prints the credit within a
    few seconds.

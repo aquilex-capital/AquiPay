@@ -33,6 +33,7 @@ interface InvoiceRow {
   metadata: unknown
   address: string
   created_at: Date
+  expires_at: Date
 }
 
 interface TransferRow {
@@ -90,6 +91,7 @@ export function buildServer(ctx: Context): FastifyInstance {
     address: getAddress(row.address),
     checkout_url: `${config.publicBaseUrl}/checkout/${row.id}`,
     created_at: row.created_at,
+    expires_at: row.expires_at,
     networks,
     transfers: transfers.map(presentTransfer),
   })
@@ -129,16 +131,17 @@ export function buildServer(ctx: Context): FastifyInstance {
       const salt = invoiceSalt(id)
       const address = forwarderAddress(config.factory, config.implementation, salt).toLowerCase()
       const [row] = await sql<InvoiceRow[]>`
-        insert into invoices (id, reference, metadata, salt, address)
-        values (${id}, ${body.reference}, ${sql.json(body.metadata as never)}, ${salt}, ${address})
-        returning id, reference, metadata, address, created_at`
+        insert into invoices (id, reference, metadata, salt, address, expires_at)
+        values (${id}, ${body.reference}, ${sql.json(body.metadata as never)}, ${salt}, ${address},
+                now() + make_interval(secs => ${config.invoiceTtlSeconds}))
+        returning id, reference, metadata, address, created_at, expires_at`
       return reply.code(201).send(presentInvoice(row!))
     })
 
     api.get('/v1/invoices', async (request) => {
       const query = listInvoicesQuery.parse(request.query)
       const rows = await sql<InvoiceRow[]>`
-        select id, reference, metadata, address, created_at from invoices
+        select id, reference, metadata, address, created_at, expires_at from invoices
         ${query.reference ? sql`where reference = ${query.reference}` : sql``}
         order by created_at desc limit ${query.limit}`
       return { data: rows.map((row) => presentInvoice(row)) }
@@ -147,7 +150,7 @@ export function buildServer(ctx: Context): FastifyInstance {
     api.get('/v1/invoices/:id', async (request, reply) => {
       const { id } = uuidParam.parse(request.params)
       const [row] = await sql<InvoiceRow[]>`
-        select id, reference, metadata, address, created_at from invoices where id = ${id}`
+        select id, reference, metadata, address, created_at, expires_at from invoices where id = ${id}`
       if (!row) return reply.code(404).send({ error: 'not_found' })
       return presentInvoice(row, await transfersOf(id))
     })
@@ -186,13 +189,15 @@ export function buildServer(ctx: Context): FastifyInstance {
     // A mistyped link gets the same page as an unknown invoice.
     const params = uuidParam.safeParse(request.params)
     const [row] = params.success
-      ? await sql<InvoiceRow[]>`
-          select id, reference, metadata, address, created_at from invoices where id = ${params.data.id}`
+      ? await sql<{ id: string; address: string; seconds_left: number }[]>`
+          select id, address, greatest(0, ceil(extract(epoch from expires_at - now())))::int as seconds_left
+          from invoices where id = ${params.data.id}`
       : []
     if (!row) return sendPage(404, renderNotFound(nonce))
     const html = await renderCheckout({
       invoiceId: row.id,
       address: getAddress(row.address),
+      secondsLeft: row.seconds_left,
       nonce,
       networks: config.chains.map((chain) => ({
         key: chain.key,
@@ -212,8 +217,11 @@ export function buildServer(ctx: Context): FastifyInstance {
 
   app.get('/checkout/:id/status', async (request, reply) => {
     const { id } = uuidParam.parse(request.params)
+    const [invoice] = await sql<{ expired: boolean }[]>`select expires_at <= now() as expired from invoices where id = ${id}`
     const transfers = await transfersOf(id)
     return reply.header('cache-control', 'no-store').send({
+      // So an open page stops showing the address even if its own clock is off.
+      expired: invoice?.expired ?? true,
       transfers: transfers
         .filter((row) => row.status !== 'orphaned')
         .map((row) => ({

@@ -3,10 +3,13 @@
 Self-hosted USDT payment gateway for EVM chains (Ethereum, Arbitrum, Optimism,
 Polygon, BNB Smart Chain).
 
-Your backend creates an invoice and gets a deposit address. Every USDT transfer
-to that address at or above the chain minimum is a top-up: AquiPay waits for
-confirmations and sends your backend a signed webhook. Funds are swept
-automatically to one wallet you control.
+Your backend creates an invoice and gets a deposit address, live for ten
+minutes. Every USDT transfer to that address at or above the chain minimum is a
+top-up: AquiPay waits for confirmations and sends your backend a signed
+webhook. Funds are swept automatically to one wallet you control.
+
+It is built to run on a free RPC plan: with no checkout open it makes no RPC
+call at all, and with any number open it makes two per chain per poll.
 
 ## How it works
 
@@ -14,14 +17,34 @@ automatically to one wallet you control.
   pre-computed (CREATE2) address of a tiny forwarder contract. It has no private
   key, and the only thing it can do is send its balance to the destination
   wallet stored in the factory. The same address is valid on every chain.
-- **Watcher** (one per chain) reads USDT `Transfer` logs into invoice addresses,
-  records them as `pending`, and marks them `confirmed` once they are deep
-  enough and still on the canonical chain. Transfers in reorged-out blocks
-  become `orphaned`.
+- **Watcher** (one per chain) reads the USDT balance of every live invoice
+  address in one Multicall3 call per poll. Only when a balance moves does it
+  look for the transfers behind it: it halves the block range on past balances
+  until a piece fits one `eth_getLogs` (10 blocks, what free plans allow), so
+  a payment costs a handful of calls. It records them as `pending`, and marks
+  them `confirmed` once they are deep enough and still on the canonical chain.
+  Transfers in reorged-out blocks become `orphaned`, and the address is
+  searched again in case the transaction lands elsewhere. It refuses to take a
+  balance as accounted for until the logs it found add up to the change, so a
+  lagging node costs a retry rather than a payment.
+- **Expiry and late payments.** An address is read every poll while its invoice
+  is live (`INVOICE_TTL_SECONDS`, 10 minutes), once more after it expires, and
+  then once an hour for `LATE_PAYMENT_HOURS` (24): a payment that lands late is
+  still credited, within the hour. After that the address is no longer read;
+  money sent to it stays there, and is returned by hand. Nothing older is ever
+  read, so the work does not grow with every invoice you have made.
 - **Dispatcher** delivers `topup.confirmed` webhooks from an outbox table, with
   retries and exponential backoff.
 - **Sweeper** calls `factory.sweep(...)` in batches. Its key only pays gas; if it
-  leaks, the worst an attacker can do is pay for your sweeps.
+  leaks, the worst an attacker can do is pay for your sweeps. It sweeps an
+  address only once the watcher is done with it, after the late-payment
+  window: the watcher finds payments by a balance going up, and emptying an
+  address it still reads could hide one that lands in the same poll. Anyone can
+  flush a forwarder, though, so the watcher also checks whether one exists. A
+  live address whose forwarder exists has its logs read every poll, as its
+  balance no longer tells. An address flushed after its last poll, and paid
+  again within the late window, is the one case left: the hourly look sees no
+  change, and that payment is in your wallet, to be returned by hand.
 - **API** serves the merchant endpoints and the hosted checkout page.
 
 All roles are one Docker image: `api | watcher | dispatcher | sweeper | migrate | all`.
@@ -32,7 +55,8 @@ All roles are one Docker image: `api | watcher | dispatcher | sweeper | migrate 
 |---|---|
 | Minimum | 10 USDT (20 on Ethereum). Set with `MIN_TOPUP_<CHAIN>`. |
 | Below minimum | Small transfers accumulate per invoice and network. Once the uncredited total reaches the minimum, they are credited together as one top-up. Until then they have `credited: false` (list with `GET /v1/transfers?status=confirmed&credited=false`) and are still swept. |
-| Repeat payments | Each time the uncredited total reaches the minimum, that is a separate top-up. Addresses never expire. |
+| Repeat payments | Each time the uncredited total reaches the minimum, that is a separate top-up, for as long as the address is read. |
+| Expiry | An address is live for `INVOICE_TTL_SECONDS` (600). Payments landing up to `LATE_PAYMENT_HOURS` (24) after expiry are credited on the hourly pass; later ones are not seen. |
 | Amount | 1 USDT = 1 unit. Amounts are decimal strings (`"25.5"`). |
 
 ## Local development
@@ -44,7 +68,7 @@ npm install
 docker compose up -d               # Postgres + local chain (anvil)
 npm run contracts:build
 cp .env.example .env
-node scripts/dev-setup.ts >> .env  # deploys mock USDT + factory, appends their addresses
+node scripts/dev-setup.ts >> .env  # deploys mock USDT + factory, appends their addresses, puts Multicall3 on anvil
 npm run dev                        # all roles in one process, applies migrations
 ```
 
@@ -68,11 +92,11 @@ All `/v1/*` requests need `Authorization: Bearer $API_KEY`.
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /v1/invoices` | Body `{"reference": "user-42", "metadata": {...}}`. Returns `id`, `address`, `checkout_url`, `networks`. |
+| `POST /v1/invoices` | Body `{"reference": "user-42", "metadata": {...}}`. Returns `id`, `address`, `checkout_url`, `expires_at`, `networks`. |
 | `GET /v1/invoices/:id` | Invoice with its transfers. |
 | `GET /v1/invoices?reference=` | Look up invoices by your reference. |
 | `GET /v1/transfers?chain=&status=&credited=` | Recent transfers, for reconciliation. |
-| `GET /checkout/:id` | Public hosted checkout page (QR code, network picker, live status). |
+| `GET /checkout/:id` | Public hosted checkout page (QR code, network picker, countdown, live status). Once expired it no longer shows the address. |
 
 ### Webhook
 
@@ -160,9 +184,27 @@ All `/v1/*` requests need `Authorization: Bearer $API_KEY`.
   is expensive.
 - **Frozen addresses**: if a flush reverts (Tether froze the address), the
   transfer gets a `sweep_error` and is skipped until you clear that column.
-- **RPC**: list at least two providers per chain. Public endpoints often cap
-  `eth_getLogs`; lower `LOG_RANGE_<CHAIN>` if you see range errors.
-- **Scale**: the watcher filters logs by invoice address, 200 addresses per
-  request. That is cheap up to tens of thousands of invoices; beyond that,
-  switch to scanning all USDT transfers and matching locally.
+- **RPC**: one provider per chain is enough; later URLs are fallbacks. The
+  defaults fit a free plan such as Alchemy's. The watcher needs `eth_call` at
+  past blocks; without it, set `HISTORICAL_READS=false` and it reads logs
+  instead, `LOG_RANGE` blocks at a time.
+- **Tuning** (each `<CHAIN>` setting also has a chain-wide form without the
+  suffix, which the suffixed one overrides):
+
+  | Variable | Default | What it sets |
+  |---|---|---|
+  | `INVOICE_TTL_SECONDS` | 600 | How long an invoice's address is live |
+  | `LATE_PAYMENT_HOURS` | 24 | How long after expiry a payment is still looked for; 0 for never |
+  | `LATE_PASS_SECONDS` | 3600 | How often addresses in that window are read |
+  | `POLL_SECONDS_<CHAIN>` | 5 (12 on Ethereum) | How often live addresses are read |
+  | `LOG_RANGE_<CHAIN>` | 10 | Blocks per `eth_getLogs` |
+  | `HISTORICAL_READS_<CHAIN>` | true | Whether the RPC answers `eth_call` at past blocks |
+  | `MULTICALL_BATCH` | 500 | Addresses per Multicall3 call |
+  | `MULTICALL3_ADDRESS_<CHAIN>` | `0xcA11bde05977b3631167028862bE2a173976CA11` | Where Multicall3 is |
+  | `MIN_BLOCK_MS_<CHAIN>` | per chain | A lower bound on block time, for how far back a new address's first search reaches |
+
+- **Cost**: per chain, two calls per poll while any checkout is open, plus about
+  `log2(blocks / LOG_RANGE)` calls for each payment, plus one call an hour
+  while any address is in the late window. On Alchemy's free plan that is
+  roughly 17,000 compute units for a ten-minute checkout across four chains.
 - **Not included yet**: database backups to S3, metrics, an admin UI.

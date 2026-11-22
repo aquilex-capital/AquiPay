@@ -3,7 +3,7 @@ import { parseGwei } from 'viem'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { renderCheckout, renderNotFound } from '../src/api/checkout.ts'
 import { isRole, loop } from '../src/app.ts'
-import { loadConfig } from '../src/config.ts'
+import { loadConfig, MULTICALL3 } from '../src/config.ts'
 import { rpcTransport, type Context } from '../src/context.ts'
 import { signPayload, verifySignature } from '../src/dispatcher.ts'
 import { forwarderAddress, implementationAddress, invoiceSalt } from '../src/forwarder.ts'
@@ -28,6 +28,10 @@ describe('loadConfig', () => {
       sweepBatchSize: 50,
       apiKey: undefined,
       sweeperPrivateKey: undefined,
+      invoiceTtlSeconds: 600,
+      lateWindowSeconds: 24 * 3600,
+      latePassMs: 3_600_000,
+      multicallBatch: 500,
     })
     expect(config.implementation).toBe(implementationAddress(FACTORY))
     expect(config.chains).toHaveLength(1)
@@ -39,10 +43,69 @@ describe('loadConfig', () => {
       confirmations: 60n,
       minTopup: '10',
       minTopupRaw: 10_000_000n,
-      logRange: 1000n,
+      pollMs: 5000,
+      // What a free RPC plan allows per getLogs.
+      logRange: 10n,
+      minBlockMs: 100,
+      multicall3: MULTICALL3,
+      historicalReads: true,
       rpcUrls: [],
       maxGasPriceWei: undefined,
     })
+  })
+
+  it('tunes every chain with one setting and one chain with its own', () => {
+    const config = loadConfig({
+      ...BASE_ENV,
+      CHAINS: 'arbitrum,bsc',
+      POLL_SECONDS: '30',
+      POLL_SECONDS_BSC: '9',
+      LOG_RANGE: '500',
+      LOG_RANGE_ARBITRUM: '2000',
+      HISTORICAL_READS: 'false',
+      HISTORICAL_READS_BSC: 'TRUE',
+    })
+    const [arbitrum, bsc] = config.chains
+    expect(arbitrum).toMatchObject({ pollMs: 30_000, logRange: 2000n, historicalReads: false })
+    expect(bsc).toMatchObject({ pollMs: 9000, logRange: 500n, historicalReads: true })
+    expect(loadConfig({ ...BASE_ENV, HISTORICAL_READS: '0' }).chains[0]!.historicalReads).toBe(false)
+    expect(loadConfig({ ...BASE_ENV, HISTORICAL_READS: '1' }).chains[0]!.historicalReads).toBe(true)
+  })
+
+  it('takes the expiry, late-payment and multicall settings', () => {
+    const multicall = '0x5FbDB2315678afecb367f032d93F642f64180aa3'
+    const config = loadConfig({
+      ...BASE_ENV,
+      INVOICE_TTL_SECONDS: '900',
+      LATE_PAYMENT_HOURS: '0',
+      LATE_PASS_SECONDS: '120',
+      MULTICALL_BATCH: '50',
+      MIN_BLOCK_MS_ARBITRUM: '0',
+      MULTICALL3_ADDRESS_ARBITRUM: multicall.toLowerCase(),
+    })
+    expect(config).toMatchObject({ invoiceTtlSeconds: 900, lateWindowSeconds: 0, latePassMs: 120_000, multicallBatch: 50 })
+    expect(config.chains[0]).toMatchObject({ minBlockMs: 0, multicall3: multicall })
+
+    // Each also has a form for every chain, which the chain's own overrides.
+    const [arbitrum, bsc] = loadConfig({
+      ...BASE_ENV,
+      CHAINS: 'arbitrum,bsc',
+      MIN_BLOCK_MS: '200',
+      MIN_BLOCK_MS_BSC: '50',
+      MULTICALL3_ADDRESS: multicall,
+    }).chains
+    expect(arbitrum).toMatchObject({ minBlockMs: 200, multicall3: multicall })
+    expect(bsc).toMatchObject({ minBlockMs: 50, multicall3: multicall })
+  })
+
+  it('polls Ethereum less often than the faster chains', () => {
+    const config = loadConfig({ ...BASE_ENV, CHAINS: 'ethereum,optimism,polygon,bsc' })
+    expect(config.chains.map((chain) => [chain.key, chain.pollMs, chain.minBlockMs])).toEqual([
+      ['ethereum', 12_000, 6000],
+      ['optimism', 5000, 500],
+      ['polygon', 5000, 500],
+      ['bsc', 5000, 100],
+    ])
   })
 
   it('reads process.env when called without arguments', () => {
@@ -107,7 +170,7 @@ describe('loadConfig', () => {
   it('takes the local chain USDT address from the environment', () => {
     const usdt = '0x2279B7A0a67DB372996a5FaB50D91eAA73d2eBe6'
     const config = loadConfig({ ...BASE_ENV, CHAINS: 'local', USDT_ADDRESS_LOCAL: usdt.toLowerCase() })
-    expect(config.chains[0]).toMatchObject({ key: 'local', usdt, confirmations: 2n })
+    expect(config.chains[0]).toMatchObject({ key: 'local', usdt, confirmations: 2n, pollMs: 1000, minBlockMs: 0 })
     expect(() => loadConfig({ ...BASE_ENV, CHAINS: 'local' })).toThrow('USDT_ADDRESS_LOCAL')
   })
 
@@ -121,6 +184,16 @@ describe('loadConfig', () => {
     [{ PORT: 'http' }, 'PORT must be a positive integer'],
     [{ CONFIRMATIONS_ARBITRUM: '1.5' }, 'CONFIRMATIONS_ARBITRUM must be a positive integer'],
     [{ SWEEPER_PRIVATE_KEY: 'not-a-key' }, 'SWEEPER_PRIVATE_KEY must be'],
+    [{ INVOICE_TTL_SECONDS: '0' }, 'INVOICE_TTL_SECONDS must be a positive integer'],
+    [{ LATE_PAYMENT_HOURS: '-1' }, 'LATE_PAYMENT_HOURS must be a non-negative integer'],
+    [{ LATE_PASS_SECONDS: '0' }, 'LATE_PASS_SECONDS must be a positive integer'],
+    [{ MULTICALL_BATCH: '0' }, 'MULTICALL_BATCH must be a positive integer'],
+    [{ POLL_SECONDS: '0.5' }, 'POLL_SECONDS must be a positive integer'],
+    [{ POLL_SECONDS_ARBITRUM: 'soon' }, 'POLL_SECONDS_ARBITRUM must be a positive integer'],
+    [{ LOG_RANGE: '0' }, 'LOG_RANGE must be a positive integer'],
+    [{ MIN_BLOCK_MS_ARBITRUM: '-5' }, 'MIN_BLOCK_MS_ARBITRUM must be a non-negative integer'],
+    [{ HISTORICAL_READS_ARBITRUM: 'sometimes' }, 'HISTORICAL_READS_ARBITRUM must be true or false'],
+    [{ MULTICALL3_ADDRESS_ARBITRUM: '0x12' }, 'MULTICALL3_ADDRESS_ARBITRUM is not a valid address'],
     [{ SWEEPER_PRIVATE_KEY: '0xabcd' }, 'SWEEPER_PRIVATE_KEY must be'],
   ])('rejects %j', (override, message) => {
     expect(() => loadConfig({ ...BASE_ENV, ...override })).toThrow(message)
@@ -192,6 +265,7 @@ describe('checkout page', () => {
   const view = {
     invoiceId: 'e01ae86c-9266-4bf7-b1ee-7a503f92de66',
     address: '0xf3ed68Da02C53c64c4cf880D254A8442d4535638',
+    secondsLeft: 599,
     nonce: 'nonce-123',
     networks: [
       { key: 'arbitrum', name: 'Arbitrum One', minAmount: '10', explorerTx: 'https://arbiscan.io/tx/' },
@@ -234,6 +308,26 @@ describe('checkout page', () => {
     expect(html).toContain('&lt;script&gt;alert(&#39;1&#39;)&lt;/script&gt; &amp; co')
     expect(html).toContain('value="x&quot;y"')
     expect(html).toContain('\\u003cscript>alert')
+  })
+
+  it("says how long the address is live, and counts down from the server's figure", async () => {
+    const html = await renderCheckout(view)
+    expect(html).toContain('<span class="clock" id="clock" role="timer">9:59</span> more')
+    expect(html).toContain('"secondsLeft":599')
+    // The expired notice is on the page, hidden until the clock runs out.
+    expect(html).toMatch(/<section class="card" id="expired" hidden>/)
+  })
+
+  it('leaves the address and its QR code off the page once it has expired', async () => {
+    const html = await renderCheckout({ ...view, secondsLeft: 0 })
+    expect(html).toContain("This address has expired. Don't send to it.")
+    expect(html).toMatch(/<section class="card" id="expired">/)
+    expect(html).not.toContain('id="live"')
+    expect(html).not.toContain('aria-label="0xf3ed')
+    expect(html).not.toContain('data:image/png')
+    expect(html).not.toContain('id="copy"')
+    // Payments that were sent in time still show.
+    expect(html).toContain('id="payments"')
   })
 
   it('renders the not-found page without a script', () => {

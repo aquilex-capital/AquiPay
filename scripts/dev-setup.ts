@@ -1,5 +1,6 @@
-// Deploys MockUSDT and the ForwarderFactory to the local anvil node and prints
-// the matching .env lines. Run `npm run contracts:build` first.
+// Deploys MockUSDT and the ForwarderFactory to the local anvil node, puts
+// Multicall3 at its usual address (anvil has none), and prints the matching
+// .env lines. Run `npm run contracts:build` first.
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { createWalletClient, http, parseUnits, publicActions, type Address } from 'viem'
@@ -17,14 +18,19 @@ const client = createWalletClient({ account: deployer, chain: foundry, transport
 function artifact(name: string) {
   const path = join(import.meta.dirname, '..', 'contracts', 'out', `${name}.sol`, `${name}.json`)
   const json = JSON.parse(readFileSync(path, 'utf8'))
-  return { abi: json.abi, bytecode: json.bytecode.object }
+  return { abi: json.abi, bytecode: json.bytecode.object, deployedBytecode: json.deployedBytecode.object }
 }
 
 async function deploy(name: string, args: unknown[]): Promise<Address> {
-  const hash = await client.deployContract({ ...artifact(name), args })
+  const { abi, bytecode } = artifact(name)
+  const hash = await client.deployContract({ abi, bytecode, args })
   return (await client.waitForTransactionReceipt({ hash })).contractAddress!
 }
 
+await client.request({
+  method: 'anvil_setCode' as never,
+  params: ['0xcA11bde05977b3631167028862bE2a173976CA11', artifact('Multicall3').deployedBytecode] as never,
+})
 const usdt = await deploy('MockUSDT', [6])
 const factory = await deploy('ForwarderFactory', [DESTINATION])
 const mint = await client.writeContract({
