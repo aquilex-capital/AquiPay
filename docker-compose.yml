@@ -1,0 +1,38 @@
+# Local development stack. `docker compose up -d` starts Postgres and a local
+# chain; add `--profile app` to also run AquiPay itself from the Dockerfile.
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: aquipay
+      POSTGRES_PASSWORD: aquipay
+      POSTGRES_DB: aquipay
+    ports:
+      - "54329:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aquipay"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  anvil:
+    image: ghcr.io/foundry-rs/foundry:stable
+    entrypoint: ["anvil", "--host", "0.0.0.0"]
+    ports:
+      - "8545:8545"
+
+  app:
+    profiles: ["app"]
+    build: .
+    command: ["all"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://aquipay:aquipay@postgres:5432/aquipay
+      RPC_URLS_LOCAL: http://anvil:8545
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      anvil:
+        condition: service_started

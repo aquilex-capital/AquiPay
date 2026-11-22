@@ -1,0 +1,6 @@
+apiVersion: v2
+name: aquipay
+description: Self-hosted USDT payment gateway for EVM chains
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

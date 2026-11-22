@@ -1,0 +1,35 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "aquipay.fullname" . }}-dispatcher
+  labels:
+    {{- include "aquipay.labels" . | nindent 4 }}
+    app.kubernetes.io/component: dispatcher
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "aquipay.selectorLabels" (dict "root" . "component" "dispatcher") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "aquipay.selectorLabels" (dict "root" . "component" "dispatcher") | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- include "aquipay.podScheduling" . | nindent 6 }}
+      containers:
+        - name: dispatcher
+          image: {{ include "aquipay.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["dispatcher"]
+          env:
+            {{- include "aquipay.env" (dict "root" .) | nindent 12 }}
+          envFrom:
+            - secretRef:
+                name: {{ .Values.existingSecret }}
+          resources:
+            {{- toYaml .Values.dispatcher.resources | nindent 12 }}
+          {{- include "aquipay.containerSecurity" . | nindent 10 }}

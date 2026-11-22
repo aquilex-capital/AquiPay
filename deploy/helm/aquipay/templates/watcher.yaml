@@ -1,0 +1,42 @@
+{{- range $chain := .Values.config.chains }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "aquipay.fullname" $ }}-watcher-{{ $chain }}
+  labels:
+    {{- include "aquipay.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: watcher-{{ $chain }}
+spec:
+  # One watcher per chain. Passes are idempotent, so a brief overlap during a
+  # rollout is harmless, but a second replica would only double the RPC bill.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "aquipay.selectorLabels" (dict "root" $ "component" (printf "watcher-%s" $chain)) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "aquipay.selectorLabels" (dict "root" $ "component" (printf "watcher-%s" $chain)) | nindent 8 }}
+      {{- with $.Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- include "aquipay.podScheduling" $ | nindent 6 }}
+      containers:
+        - name: watcher
+          image: {{ include "aquipay.image" $ }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          args: ["watcher"]
+          env:
+            {{- include "aquipay.env" (dict "root" $ "chains" $chain) | nindent 12 }}
+          envFrom:
+            - secretRef:
+                name: {{ $.Values.existingSecret }}
+          resources:
+            {{- toYaml $.Values.watcher.resources | nindent 12 }}
+          {{- include "aquipay.containerSecurity" $ | nindent 10 }}
+{{- end }}

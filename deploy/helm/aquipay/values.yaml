@@ -1,0 +1,72 @@
+image:
+  repository: ghcr.io/aquilex-capital/aquipay
+  # Defaults to the chart appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+config:
+  # Public origin of the checkout page, without a trailing slash.
+  publicBaseUrl: https://pay.example.com
+  # Where topup.confirmed events are POSTed.
+  webhookUrl: https://app.example.com/webhooks/aquipay
+  # ForwarderFactory address; identical on every chain.
+  forwarderFactoryAddress: ""
+  # One watcher Deployment is created per chain.
+  chains:
+    - arbitrum
+    - bsc
+    - polygon
+    - optimism
+    - ethereum
+  # Extra non-secret settings, e.g. MAX_GAS_PRICE_GWEI_ETHEREUM: "5"
+  extraEnv: {}
+
+# Secret you create beforehand. Keys: DATABASE_URL, API_KEY, WEBHOOK_SECRET,
+# and RPC_URLS_<CHAIN> (comma-separated) for every chain listed above.
+existingSecret: aquipay
+
+api:
+  replicas: 2
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { memory: 256Mi }
+
+watcher:
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { memory: 256Mi }
+
+dispatcher:
+  resources:
+    requests: { cpu: 20m, memory: 96Mi }
+    limits: { memory: 192Mi }
+
+sweeper:
+  enabled: true
+  # Separate Secret with the single key SWEEPER_PRIVATE_KEY. Mounted only into
+  # the sweeper pod. This key pays gas; it cannot move customer funds anywhere
+  # except the factory's destination wallet.
+  existingSecret: aquipay-sweeper
+  intervalSeconds: 3600
+  batchSize: 50
+  resources:
+    requests: { cpu: 20m, memory: 96Mi }
+    limits: { memory: 192Mi }
+
+service:
+  port: 80
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  host: pay.example.com
+  tls:
+    enabled: true
+    secretName: aquipay-tls
+
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
