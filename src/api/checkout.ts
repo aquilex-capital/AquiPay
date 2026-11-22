@@ -320,7 +320,7 @@ export async function renderCheckout(view: CheckoutView): Promise<string> {
       <ul class="payments" id="payments" aria-live="polite"></ul>
     </div>
   </section>`
-  const script = `<script type="application/json" id="data">${scriptJson({ address: view.address, secondsLeft: view.secondsLeft, networks: view.networks })}</script>
+  const script = `<script type="application/json" id="data">${scriptJson({ address: view.secondsLeft > 0 ? view.address : null, secondsLeft: view.secondsLeft, networks: view.networks })}</script>
 <script nonce="${view.nonce}">${SCRIPT}</script>`
   return page(view.nonce, 'Top up with USDT', body, script)
 }

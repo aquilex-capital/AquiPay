@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { formatUnits, type Address, type Hex } from 'viem'
-import type { ChainConfig } from './config.ts'
+import { balanceOfCall, readAddresses, type Reading } from './chain.ts'
+import type { ChainConfig, Config } from './config.ts'
 import { publicClient, type Context } from './context.ts'
 import { erc20Abi } from './forwarder.ts'
 
@@ -14,34 +15,17 @@ interface WatchedRow {
   checked_through: bigint | null
   /** The balance at checked_through; null when a reorg asked for a fresh search. */
   balance: string | null
+  /** Read every poll: live, not yet looked at since expiry, or due a search again. */
+  polled: boolean
 }
 
-/** USDT balances of `addresses` at `blockNumber` (the tip if omitted): one eth_call per MULTICALL_BATCH addresses. */
-export async function balancesAt(
-  ctx: Context,
-  chain: ChainConfig,
-  addresses: readonly Address[],
-  blockNumber?: bigint,
-): Promise<bigint[]> {
-  const client = publicClient(chain)
-  const balances: bigint[] = []
-  for (let i = 0; i < addresses.length; i += ctx.config.multicallBatch) {
-    const results = await client.multicall({
-      contracts: addresses.slice(i, i + ctx.config.multicallBatch).map((address) => ({
-        address: chain.usdt,
-        abi: erc20Abi,
-        functionName: 'balanceOf' as const,
-        args: [address] as const,
-      })),
-      blockNumber,
-      allowFailure: false,
-      multicallAddress: chain.multicall3,
-      // viem splits calls by calldata size unless told not to; the batch is ours.
-      batchSize: 0,
-    })
-    balances.push(...(results as bigint[]))
-  }
-  return balances
+/**
+ * How long after expiry an address can still be read: the late window, and
+ * two late passes more for the look after it closes. Past this the watcher
+ * never reads the address again, which is also when the sweeper may empty it.
+ */
+export function watchHorizonSeconds(config: Config): number {
+  return config.lateWindowSeconds + (2 * config.latePassMs) / 1000
 }
 
 /**
@@ -52,22 +36,28 @@ export async function balancesAt(
  *
  * Watched are: addresses that are live, each address once more after it
  * expires, addresses a reorg asked to search again and, with `late`, every
- * address inside the late-payment window. Safe to run repeatedly and after
- * any downtime.
+ * address inside the late-payment window. Nothing past the horizon
+ * (watchHorizonSeconds), so the work does not grow with every invoice ever
+ * made. Safe to run repeatedly and after any downtime.
  */
 export async function watcherTick(ctx: Context, chain: ChainConfig, { late = false } = {}): Promise<void> {
   const { sql, config } = ctx
+  const polled = sql`(i.expires_at > now() or w.invoice_id is null or w.checked_at < i.expires_at or w.balance is null)`
   const watched = await sql<WatchedRow[]>`
     select i.id, i.address, (extract(epoch from now() - i.created_at) * 1000)::float8 as age_ms,
-           w.invoice_id is not null as seen, w.checked_through, w.balance::text as balance
+           w.invoice_id is not null as seen, w.checked_through, w.balance::text as balance, ${polled} as polled
     from invoices i
     left join watch_state w on w.invoice_id = i.id and w.chain = ${chain.key}
-    where i.expires_at > now()
-       or w.invoice_id is null
-       or w.checked_at < i.expires_at
-       or w.balance is null
-       ${late ? sql`or w.checked_at < i.expires_at + make_interval(secs => ${config.lateWindowSeconds})` : sql``}
-    order by i.created_at`
+    where i.expires_at > now() - make_interval(secs => ${watchHorizonSeconds(config)})
+      and (${polled}
+           ${late ? sql`or w.checked_at < i.expires_at + make_interval(secs => ${config.lateWindowSeconds})` : sql``})
+    union
+    -- A reorg's search again, however old the address.
+    select i.id, i.address, (extract(epoch from now() - i.created_at) * 1000)::float8,
+           true, w.checked_through, null, true
+    from watch_state w join invoices i on i.id = w.invoice_id
+    where w.chain = ${chain.key} and w.balance is null
+    order by age_ms desc`
   const [{ confirming }] = (await sql`
     select exists (select 1 from transfers where chain = ${chain.key} and status = 'pending') as confirming`) as [
     { confirming: boolean },
@@ -80,19 +70,24 @@ export async function watcherTick(ctx: Context, chain: ChainConfig, { late = fal
   await settlePending(ctx, chain, latest)
 }
 
+type Entry = { row: WatchedRow } & Reading
+
 async function detect(ctx: Context, chain: ChainConfig, watched: WatchedRow[], latest: bigint): Promise<void> {
-  const balances = await balancesAt(ctx, chain, watched.map((row) => row.address), latest)
-  const unchanged: { row: WatchedRow; balance: bigint }[] = []
-  const moved: { row: WatchedRow; balance: bigint }[] = []
+  const readings = await readAddresses(ctx, chain, watched.map((row) => row.address), latest)
+  const unchanged: Entry[] = []
+  const moved: Entry[] = []
   watched.forEach((row, i) => {
-    const balance = balances[i]!
+    const entry = { row, ...readings[i]! }
     const known = row.seen ? (row.balance === null ? undefined : BigInt(row.balance)) : 0n
-    ;(known === balance ? unchanged : moved).push({ row, balance })
+    // Someone flushed a live address: a balance back where it was no longer
+    // means nothing arrived, so its logs are read every poll.
+    const flushable = entry.deployed && row.polled
+    ;(known === entry.balance && !flushable ? unchanged : moved).push(entry)
   })
   await saveState(ctx, chain, unchanged, latest)
   for (const entry of moved) {
     try {
-      await locate(ctx, chain, entry.row, entry.balance, latest)
+      await locate(ctx, chain, entry, latest)
       await saveState(ctx, chain, [entry], latest)
     } catch (err) {
       // Left as it was, so the next pass searches the same blocks again.
@@ -101,23 +96,22 @@ async function detect(ctx: Context, chain: ChainConfig, watched: WatchedRow[], l
   }
 }
 
-async function saveState(
-  ctx: Context,
-  chain: ChainConfig,
-  entries: { row: WatchedRow; balance: bigint }[],
-  latest: bigint,
-): Promise<void> {
-  if (entries.length === 0) return
-  const rows = entries.map(({ row, balance }) => ({
-    invoice_id: row.id,
-    chain: chain.key,
-    checked_through: latest.toString(),
-    balance: balance.toString(),
-  }))
-  await ctx.sql`
-    insert into watch_state ${ctx.sql(rows)}
-    on conflict (invoice_id, chain) do update
-      set checked_through = excluded.checked_through, balance = excluded.balance, checked_at = now()`
+// Four parameters a row, well inside Postgres's 65,535 per statement.
+const SAVE_BATCH = 1000
+
+async function saveState(ctx: Context, chain: ChainConfig, entries: Entry[], latest: bigint): Promise<void> {
+  for (let i = 0; i < entries.length; i += SAVE_BATCH) {
+    const rows = entries.slice(i, i + SAVE_BATCH).map(({ row, balance }) => ({
+      invoice_id: row.id,
+      chain: chain.key,
+      checked_through: latest.toString(),
+      balance: balance.toString(),
+    }))
+    await ctx.sql`
+      insert into watch_state ${ctx.sql(rows)}
+      on conflict (invoice_id, chain) do update
+        set checked_through = excluded.checked_through, balance = excluded.balance, checked_at = now()`
+  }
 }
 
 /**
@@ -126,18 +120,19 @@ async function saveState(
  *
  * It halves the block range on past balances until a piece is no longer than
  * LOG_RANGE, then reads that piece's logs; a piece whose ends hold the same
- * balance received nothing, because nothing leaves an address while it is
- * watched (the sweeper waits until it is not). An hour of Arbitrum is
- * therefore a dozen calls rather than fourteen hundred. Without past
- * balances, it reads the logs of the whole range.
+ * balance received nothing, because nothing leaves an address before its
+ * forwarder exists, and our sweeper does not make one while the address is
+ * read. An hour of Arbitrum is therefore a dozen calls rather than fourteen
+ * hundred. Without past balances, or once anyone has made the forwarder, it
+ * reads the logs of the whole range.
  */
-async function locate(ctx: Context, chain: ChainConfig, row: WatchedRow, balance: bigint, latest: bigint): Promise<void> {
+async function locate(ctx: Context, chain: ChainConfig, entry: Entry, latest: bigint): Promise<void> {
+  const { row, balance, deployed } = entry
   const client = publicClient(chain)
-  const usdt = { address: chain.usdt, abi: erc20Abi, functionName: 'balanceOf' as const, args: [row.address] as const }
   const balanceAt = async (blockNumber: bigint): Promise<bigint | undefined> => {
-    if (!chain.historicalReads) return undefined
+    if (!chain.historicalReads || deployed) return undefined
     try {
-      return await client.readContract({ ...usdt, blockNumber })
+      return await client.readContract({ ...balanceOfCall(chain, row.address), blockNumber })
     } catch (err) {
       ctx.log.warn({ err, chain: chain.key, blockNumber: blockNumber.toString() }, 'past balance refused; reading logs instead')
       return undefined
@@ -159,7 +154,9 @@ async function locate(ctx: Context, chain: ChainConfig, row: WatchedRow, balance
     fromBalance = 0n
   }
 
+  // All that the logs show arriving, and the part after the last look.
   let received = 0n
+  let receivedSince = 0n
   const scan = async (first: bigint, last: bigint) => {
     for (let start = first; start <= last; start += chain.logRange) {
       const end = start + chain.logRange - 1n < last ? start + chain.logRange - 1n : last
@@ -173,13 +170,14 @@ async function locate(ctx: Context, chain: ChainConfig, row: WatchedRow, balance
       })
       for (const log of logs) {
         received += log.args.value
+        if (row.checked_through === null || log.blockNumber > row.checked_through) receivedSince += log.args.value
         await record(ctx, chain, row.id, log)
       }
     }
   }
   // Transfers in blocks (lo, hi], which took the balance from loBalance to hiBalance.
   const search = async (lo: bigint, hi: bigint, loBalance: bigint | undefined, hiBalance: bigint): Promise<void> => {
-    if (loBalance === hiBalance) return
+    if (loBalance === hiBalance && !deployed) return
     if (loBalance === undefined || hi - lo <= chain.logRange) return scan(lo + 1n, hi)
     const mid = lo + (hi - lo) / 2n
     const midBalance = await balanceAt(mid)
@@ -187,16 +185,20 @@ async function locate(ctx: Context, chain: ChainConfig, row: WatchedRow, balance
     await search(lo, mid, loBalance, midBalance)
     await search(mid, hi, midBalance, hiBalance)
   }
-  await search(from, latest, fromBalance, balance)
+  await search(from, latest, deployed ? undefined : fromBalance, balance)
 
   // A node that answered the balance but not yet the logs would otherwise
-  // leave a payment unrecorded and the balance marked as seen.
-  // Without a past balance, what was last seen is the baseline; a reorg's
-  // search again from a forgotten balance has none.
-  const baseline = fromBalance ?? (row.balance === null ? undefined : BigInt(row.balance))
-  const expected = baseline === undefined ? 0n : balance - baseline
-  if (received < expected) {
-    throw new Error(`found ${received} of the ${expected} that arrived at ${row.address}`)
+  // leave a payment unrecorded and the balance marked as seen. Against a
+  // past balance, everything found counts; against the one last seen, only
+  // what arrived after it, as the search also re-reads the blocks before.
+  // A reorg's search again from a forgotten balance has no baseline, and a
+  // flushed address none that money leaving it would not upset.
+  if (deployed) return
+  const known = row.balance === null ? undefined : BigInt(row.balance)
+  const [found, expected] =
+    fromBalance !== undefined ? [received, balance - fromBalance] : [receivedSince, known === undefined ? 0n : balance - known]
+  if (found < expected) {
+    throw new Error(`found ${found} of the ${expected} that arrived at ${row.address}`)
   }
 }
 

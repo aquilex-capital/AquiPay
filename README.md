@@ -31,7 +31,8 @@ call at all, and with any number open it makes two per chain per poll.
   is live (`INVOICE_TTL_SECONDS`, 10 minutes), once more after it expires, and
   then once an hour for `LATE_PAYMENT_HOURS` (24): a payment that lands late is
   still credited, within the hour. After that the address is no longer read;
-  money sent to it stays there, and is returned by hand.
+  money sent to it stays there, and is returned by hand. Nothing older is ever
+  read, so the work does not grow with every invoice you have made.
 - **Dispatcher** delivers `topup.confirmed` webhooks from an outbox table, with
   retries and exponential backoff.
 - **Sweeper** calls `factory.sweep(...)` in batches. Its key only pays gas; if it
@@ -39,9 +40,11 @@ call at all, and with any number open it makes two per chain per poll.
   address only once the watcher is done with it, after the late-payment
   window: the watcher finds payments by a balance going up, and emptying an
   address it still reads could hide one that lands in the same poll. Anyone can
-  flush a forwarder, so someone who pays and flushes in one poll could hide
-  their own payment the same way; the money is then in your wallet, and is
-  returned by hand.
+  flush a forwarder, though, so the watcher also checks whether one exists. A
+  live address whose forwarder exists has its logs read every poll, as its
+  balance no longer tells. An address flushed after its last poll, and paid
+  again within the late window, is the one case left: the hourly look sees no
+  change, and that payment is in your wallet, to be returned by hand.
 - **API** serves the merchant endpoints and the hosted checkout page.
 
 All roles are one Docker image: `api | watcher | dispatcher | sweeper | migrate | all`.

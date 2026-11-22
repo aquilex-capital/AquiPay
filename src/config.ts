@@ -194,8 +194,10 @@ function loadChain(env: Env, key: string): ChainConfig {
     pollMs: positiveInt(env, perChain(env, 'POLL_SECONDS', suffix), defaults.pollSeconds) * 1000,
     // Ten blocks is the widest getLogs range free RPC plans allow (Alchemy's, for one).
     logRange: BigInt(positiveInt(env, perChain(env, 'LOG_RANGE', suffix), 10)),
-    minBlockMs: positiveInt(env, `MIN_BLOCK_MS_${suffix}`, defaults.minBlockMs, { zero: true }),
-    multicall3: env[`MULTICALL3_ADDRESS_${suffix}`] ? address(env, `MULTICALL3_ADDRESS_${suffix}`) : MULTICALL3,
+    minBlockMs: positiveInt(env, perChain(env, 'MIN_BLOCK_MS', suffix), defaults.minBlockMs, { zero: true }),
+    multicall3: env[perChain(env, 'MULTICALL3_ADDRESS', suffix)]
+      ? address(env, perChain(env, 'MULTICALL3_ADDRESS', suffix))
+      : MULTICALL3,
     historicalReads: boolean(env, perChain(env, 'HISTORICAL_READS', suffix), true),
     rpcUrls: (env[`RPC_URLS_${suffix}`] ?? '').split(',').map((url) => url.trim()).filter(Boolean),
     maxGasPriceWei: maxGasPrice ? parseGwei(maxGasPrice) : undefined,

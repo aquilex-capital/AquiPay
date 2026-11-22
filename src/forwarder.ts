@@ -9,6 +9,8 @@ export const factoryAbi = parseAbi([
   'event FlushFailed(address indexed forwarder, bytes32 indexed salt)',
 ])
 
+export const forwarderAbi = parseAbi(['function factory() view returns (address)'])
+
 export const erc20Abi = parseAbi([
   'function balanceOf(address account) view returns (uint256)',
   'event Transfer(address indexed from, address indexed to, uint256 value)',

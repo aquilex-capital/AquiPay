@@ -3,7 +3,8 @@ import { privateKeyToAccount } from 'viem/accounts'
 import type { ChainConfig } from './config.ts'
 import { publicClient, rpcTransport, type Context } from './context.ts'
 import { factoryAbi } from './forwarder.ts'
-import { balancesAt } from './watcher.ts'
+import { watchHorizonSeconds } from './watcher.ts'
+import { readAddresses } from './chain.ts'
 
 interface Candidate {
   id: string
@@ -21,15 +22,19 @@ export async function sweepTick(ctx: Context, chain: ChainConfig): Promise<Hex |
   if (!config.sweeperPrivateKey) throw new Error('SWEEPER_PRIVATE_KEY is required')
   const client = publicClient(chain)
 
-  // Only addresses the watcher has finished with: it finds payments by a
-  // balance going up, so emptying an address it still reads could hide one.
+  // Only addresses the watcher is done with: it has looked after the late
+  // window closed, or the address is past the horizon it reads at all, and no
+  // reorg is waiting on a search again. It finds payments by a balance going
+  // up, so emptying an address it still reads could hide one.
   const candidates = await sql<Candidate[]>`
     select distinct i.id, i.salt, i.address
     from transfers t
     join invoices i on i.id = t.invoice_id
-    join watch_state w on w.invoice_id = i.id and w.chain = t.chain
+    left join watch_state w on w.invoice_id = i.id and w.chain = t.chain
     where t.chain = ${chain.key} and t.status = 'confirmed' and t.swept_at is null and t.sweep_error is null
-      and w.balance is not null and w.checked_at >= i.expires_at + make_interval(secs => ${config.lateWindowSeconds})
+      and (w.invoice_id is null or w.balance is not null)
+      and (w.checked_at >= i.expires_at + make_interval(secs => ${config.lateWindowSeconds})
+           or i.expires_at <= now() - make_interval(secs => ${watchHorizonSeconds(config)}))
     limit ${config.sweepBatchSize}`
   if (candidates.length === 0) return
 
@@ -41,7 +46,7 @@ export async function sweepTick(ctx: Context, chain: ChainConfig): Promise<Hex |
     }
   }
 
-  const balances = await balancesAt(ctx, chain, candidates.map((c) => c.address))
+  const balances = (await readAddresses(ctx, chain, candidates.map((c) => c.address))).map((r) => r.balance)
   const funded = candidates.filter((_, i) => balances[i]! > 0n)
   // Anyone may flush a deployed forwarder, so an empty one has already been swept.
   const alreadyEmpty = candidates.filter((_, i) => balances[i] === 0n)

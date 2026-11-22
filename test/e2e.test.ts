@@ -16,6 +16,7 @@ import {
   parseGwei,
   parseUnits,
   publicActions,
+  toHex,
   type Abi,
   type Address,
   type Hex,
@@ -29,9 +30,10 @@ import { loadConfig, type ChainConfig, type Config } from '../src/config.ts'
 import type { Context } from '../src/context.ts'
 import { connect, migrate, type Sql } from '../src/db.ts'
 import { dispatchTick, verifySignature } from '../src/dispatcher.ts'
+import { readAddresses } from '../src/chain.ts'
 import { factoryAbi } from '../src/forwarder.ts'
 import { sweepTick } from '../src/sweeper.ts'
-import { confirmTransfer, watcherTick } from '../src/watcher.ts'
+import { confirmTransfer, watchHorizonSeconds, watcherTick } from '../src/watcher.ts'
 
 const RPC_URL = process.env.TEST_RPC_URL ?? 'http://127.0.0.1:8545'
 const PG_URL = process.env.TEST_PG_URL ?? 'postgres://aquipay:aquipay@127.0.0.1:54329'
@@ -199,6 +201,13 @@ describe('AquiPay', () => {
     ctx.sql`update invoices set expires_at = now() - make_interval(secs => ${seconds}) where id = ${invoiceId}`
   /** Past the late-payment window, as if its last look came after the window closed: the watcher is done with it. */
   const finish = (invoiceId: string) => expire(invoiceId, ctx.config.lateWindowSeconds + 86_400)
+  /** Empties an invoice's address the way anyone can: ForwarderFactory.sweep is open to all. */
+  async function flush(invoiceId: string) {
+    const [row] = await ctx.sql<{ salt: Hex }[]>`select salt from invoices where id = ${invoiceId}`
+    await mined(
+      await deployer.writeContract({ address: ctx.config.factory, abi: factoryAbi, functionName: 'sweep', args: [usdt, [row!.salt]] }),
+    )
+  }
   const confirmBlocks = () => chainClient.mine({ blocks: Number(chain.confirmations) })
   /** Watcher pass, enough blocks to confirm, another pass. */
   async function settle() {
@@ -299,6 +308,15 @@ describe('AquiPay', () => {
       const names = await ctx.sql`select name from schema_migrations order by name`
       expect(names.map((row) => row.name)).toEqual(all)
     })
+
+    it('gives an invoice from the previous release ten minutes, so a rollout does not refuse it', async () => {
+      // An API pod not yet replaced inserts without expires_at.
+      const [row] = await ctx.sql`
+        insert into invoices (reference, salt, address) values ('old-release', 'old-release-salt', '0xold-release')
+        returning extract(epoch from expires_at - created_at)::int as ttl`
+      expect(row!.ttl).toBe(600)
+      await ctx.sql`delete from invoices where reference = 'old-release'`
+    })
   })
 
   // What fits a free RPC plan: nothing while no checkout is open, two calls a
@@ -346,6 +364,42 @@ describe('AquiPay', () => {
       expect(await statuses(invoice.id)).toEqual(['confirmed'])
       expect(await rpcMethods(() => tick())).toEqual([])
     })
+
+    it('fails the pass rather than guess at a balance it cannot read', async () => {
+      // USDT moved, or the wrong address configured: balanceOf answers nothing.
+      const wrongToken: ChainConfig = { ...chain, usdt: deployer.account.address }
+      await expect(readAddresses(ctx, wrongToken, [payer.account.address])).rejects.toThrow()
+    })
+
+    it('never reads an address past the horizon, however many invoices there are', async () => {
+      // Never looked at, and no late pass would reach it any more: an invoice
+      // from before the watcher ran, say. Old invoices cost nothing.
+      const old = await createInvoice('past-horizon')
+      await expire(old.id, watchHorizonSeconds(ctx.config) + 60)
+      expect(await rpcMethods(() => tick())).toEqual([])
+      await latePass()
+      expect(await ctx.sql`select 1 from watch_state where invoice_id = ${old.id}`).toHaveLength(0)
+    })
+
+    it('saves what it read of more addresses than one statement can bind', async () => {
+      // Four parameters a row against Postgres's 65,535: more than 16,383
+      // addresses would not fit one insert.
+      const count = 17_000
+      await ctx.sql`
+        -- Clear of the precompiles at 0x01 to 0x0a, which no CREATE2 address is.
+        insert into invoices (reference, salt, address)
+        select 'bulk-' || g, 'bulk-salt-' || g, '0xb' || lpad(to_hex(g), 39, '0')
+        from generate_series(1, ${count}) g`
+      try {
+        await tick()
+        const [{ saved }] = (await ctx.sql`
+          select count(*)::int as saved from watch_state w join invoices i on i.id = w.invoice_id
+          where i.reference like 'bulk-%'`) as [{ saved: number }]
+        expect(saved).toBe(count)
+      } finally {
+        await ctx.sql`update invoices set expires_at = now() - interval '30 days' where reference like 'bulk-%'`
+      }
+    }, 120_000)
   })
 
   describe('API', () => {
@@ -500,7 +554,8 @@ describe('AquiPay', () => {
       const page = await app.inject({ url: `/checkout/${invoice.id}` })
       expect(page.statusCode).toBe(200)
       expect(page.body).toContain("This address has expired. Don't send to it.")
-      expect(page.body).not.toContain(`aria-label="${invoice.address}"`)
+      // Not in the markup, and not in the data the page's script reads either.
+      expect(page.body.toLowerCase()).not.toContain(invoice.address.toLowerCase())
       expect((await app.inject({ url: `/checkout/${invoice.id}/status` })).json()).toEqual({ expired: true, transfers: [] })
       // A status poll for an id that is not an invoice says so the same way.
       expect((await app.inject({ url: `/checkout/${randomUUID()}/status` })).json()).toEqual({ expired: true, transfers: [] })
@@ -898,6 +953,70 @@ describe('AquiPay', () => {
       expect(await statuses(invoice.id)).toEqual(['pending'])
     })
 
+    it('counts only what arrived since the last look when the logs come back short without past balances', async () => {
+      // The search re-reads the confirmation depth before the last look, so the
+      // logs include a payment already counted. It must not stand in for the new one.
+      const noHistory: ChainConfig = { ...chain, historicalReads: false }
+      const invoice = await createInvoice('short-logs-no-history')
+      await tick(noHistory)
+      const first = await pay(invoice.address, '10')
+      await tick(noHistory)
+      const firstBlock = (await chainClient.getTransactionReceipt({ hash: first })).blockNumber
+      // As the node sends them, for the stand-in to send on.
+      const { result: firstLogs } = await (
+        await fetch(RPC_URL, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'eth_getLogs',
+            params: [{ address: usdt, fromBlock: toHex(firstBlock), toBlock: toHex(firstBlock) }],
+          }),
+        })
+      ).json()
+      await pay(invoice.address, '10')
+
+      // A node behind the one that answered the balance: it has the first payment, not the second.
+      const { context, errors } = recording()
+      await withFault(
+        (call) => {
+          if (call.method !== 'eth_getLogs') return undefined
+          const { fromBlock, toBlock } = call.params[0] as { fromBlock: Hex; toBlock: Hex }
+          return { result: BigInt(fromBlock) <= firstBlock && firstBlock <= BigInt(toBlock) ? firstLogs : [] }
+        },
+        () => watcherTick(context, noHistory),
+      )
+      expect(errors).toEqual([expect.objectContaining({ invoiceId: invoice.id })])
+      const [state] = await ctx.sql`select balance::text from watch_state where invoice_id = ${invoice.id}`
+      expect(state!.balance).toBe('10000000')
+
+      await tick(noHistory)
+      expect(await statuses(invoice.id)).toEqual(['pending', 'pending'])
+    })
+
+    it('finds a payment to a live address someone flushed, though its balance is back where it was', async () => {
+      const invoice = await createInvoice('flushed-live')
+      await tick()
+      await pay(invoice.address, '10')
+      await tick()
+      await flush(invoice.id)
+      const second = await pay(invoice.address, '10')
+      expect(await usdtBalance(invoice.address)).toBe(parseUnits('10', 6))
+
+      // The same balance as at the last look; the logs say otherwise.
+      await tick()
+      expect((await getInvoice(invoice.id)).transfers.map((t) => t.tx_hash)).toContain(second)
+      expect(await statuses(invoice.id)).toEqual(['pending', 'pending'])
+
+      // Once it has stopped being read every poll, it costs nothing again.
+      await expire(invoice.id, 1)
+      await tick()
+      await confirmBlocks()
+      expect((await rpcMethods(() => tick())).filter((m) => m === 'eth_getLogs')).toEqual([])
+      expect(await statuses(invoice.id)).toEqual(['confirmed', 'confirmed'])
+    })
+
     it('picks up a payment made while the watcher was not running', async () => {
       const invoice = await createInvoice('downtime')
       await tick()
@@ -1192,6 +1311,17 @@ describe('AquiPay', () => {
       expect(rows.map((row) => row.swept_tx_hash)).toEqual([sweepTx, sweepTx])
     })
 
+    it('sweeps an address the watcher never saved once it is past the horizon', async () => {
+      const invoice = await createInvoice('unsaved')
+      await pay(invoice.address, '10')
+      await settle()
+      await ctx.sql`delete from watch_state where invoice_id = ${invoice.id}`
+      await expire(invoice.id, ctx.config.lateWindowSeconds + 60)
+      expect(await sweepTick(ctx, chain)).toBeUndefined()
+      await expire(invoice.id, watchHorizonSeconds(ctx.config) + 60)
+      expect(await sweepTick(ctx, chain)).toBeDefined()
+    })
+
     it("waits for a reorg's search again before sweeping", async () => {
       const invoice = await confirmedInvoice('recheck-pending', '10')
       await ctx.sql`update watch_state set balance = null where invoice_id = ${invoice.id}`
@@ -1203,15 +1333,7 @@ describe('AquiPay', () => {
     it('marks an address someone else already flushed, and sweeps the rest', async () => {
       const flushed = await confirmedInvoice('flushed-elsewhere', '10')
       const funded = await confirmedInvoice('still-funded', '10')
-      const [row] = await ctx.sql<{ salt: Hex }[]>`select salt from invoices where id = ${flushed.id}`
-      await mined(
-        await deployer.writeContract({
-          address: ctx.config.factory,
-          abi: factoryAbi,
-          functionName: 'sweep',
-          args: [usdt, [row!.salt]],
-        }),
-      )
+      await flush(flushed.id)
 
       const sweepTx = await sweepTick(ctx, chain)
       expect(sweepTx).toBeDefined()
@@ -1222,10 +1344,7 @@ describe('AquiPay', () => {
 
       // When every address in the batch was flushed already, no transaction is sent.
       const alone = await confirmedInvoice('flushed-alone', '10')
-      const [salt] = await ctx.sql<{ salt: Hex }[]>`select salt from invoices where id = ${alone.id}`
-      await mined(
-        await deployer.writeContract({ address: ctx.config.factory, abi: factoryAbi, functionName: 'sweep', args: [usdt, [salt!.salt]] }),
-      )
+      await flush(alone.id)
       expect(await sweepTick(ctx, chain)).toBeUndefined()
       expect((await transferRow(alone.id)).swept_at).not.toBeNull()
     })

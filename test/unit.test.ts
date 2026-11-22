@@ -85,6 +85,17 @@ describe('loadConfig', () => {
     })
     expect(config).toMatchObject({ invoiceTtlSeconds: 900, lateWindowSeconds: 0, latePassMs: 120_000, multicallBatch: 50 })
     expect(config.chains[0]).toMatchObject({ minBlockMs: 0, multicall3: multicall })
+
+    // Each also has a form for every chain, which the chain's own overrides.
+    const [arbitrum, bsc] = loadConfig({
+      ...BASE_ENV,
+      CHAINS: 'arbitrum,bsc',
+      MIN_BLOCK_MS: '200',
+      MIN_BLOCK_MS_BSC: '50',
+      MULTICALL3_ADDRESS: multicall,
+    }).chains
+    expect(arbitrum).toMatchObject({ minBlockMs: 200, multicall3: multicall })
+    expect(bsc).toMatchObject({ minBlockMs: 50, multicall3: multicall })
   })
 
   it('polls Ethereum less often than the faster chains', () => {

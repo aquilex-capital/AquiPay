@@ -13,7 +13,9 @@ config:
   # ForwarderFactory address; identical on every chain.
   forwarderFactoryAddress: ""
   # One watcher Deployment is created per chain. Ethereum is left out: a
-  # sweep there costs more than a small top-up is worth. Add it if yours are large.
+  # sweep there costs more than a small top-up is worth. Add it if yours are
+  # large. Upgrading a release that had it? Keep it listed until its last
+  # transfers are confirmed and swept, or they are never finished.
   chains:
     - arbitrum
     - bsc
