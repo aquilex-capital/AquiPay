@@ -127,6 +127,8 @@ export interface Config {
   sweeperPrivateKey?: Hex
   sweepIntervalMs: number
   sweepBatchSize: number
+  /** Gas set aside for each address a sweep flushes, on top of the node's estimate. */
+  sweepFlushGas: bigint
   /** How long a new invoice's address is live. */
   invoiceTtlSeconds: number
   /** How long after expiry a payment is still looked for and credited. */
@@ -225,6 +227,7 @@ export function loadConfig(env: Env = process.env): Config {
     sweeperPrivateKey: sweeperKey as Hex | undefined,
     sweepIntervalMs: positiveInt(env, 'SWEEP_INTERVAL_SECONDS', 3600) * 1000,
     sweepBatchSize: positiveInt(env, 'SWEEP_BATCH_SIZE', 50),
+    sweepFlushGas: BigInt(positiveInt(env, 'SWEEP_FLUSH_GAS', 150_000)),
     invoiceTtlSeconds: positiveInt(env, 'INVOICE_TTL_SECONDS', 600),
     lateWindowSeconds: positiveInt(env, 'LATE_PAYMENT_HOURS', 24, { zero: true }) * 3600,
     latePassMs: positiveInt(env, 'LATE_PASS_SECONDS', 3600) * 1000,

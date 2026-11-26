@@ -6,6 +6,13 @@ import { factoryAbi } from './forwarder.ts'
 import { watchHorizonSeconds } from './watcher.ts'
 import { readAddresses } from './chain.ts'
 
+/**
+ * The most gas one transaction may ask for where EIP-7825 applies. Nodes there
+ * refuse a higher limit outright, so a large batch is held to it; a sweep whose
+ * estimate alone is above it needs a smaller SWEEP_BATCH_SIZE.
+ */
+export const TX_GAS_CAP = 2n ** 24n
+
 interface Candidate {
   id: string
   salt: Hex
@@ -57,17 +64,24 @@ export async function sweepTick(ctx: Context, chain: ChainConfig): Promise<Hex |
   }
   if (funded.length === 0) return
 
-  const wallet = createWalletClient({
-    account: privateKeyToAccount(config.sweeperPrivateKey),
-    chain: chain.viemChain,
-    transport: rpcTransport(chain),
-  })
-  const hash = await wallet.writeContract({
+  const account = privateKeyToAccount(config.sweeperPrivateKey)
+  const wallet = createWalletClient({ account, chain: chain.viemChain, transport: rpcTransport(chain) })
+  const sweep = {
     address: config.factory,
     abi: factoryAbi,
     functionName: 'sweep',
     args: [chain.usdt, funded.map((c) => c.salt)],
-  })
+  } as const
+  // The factory catches a flush that fails, so the least gas the sweep
+  // succeeds with, which is what a node estimates, can be one where a flush
+  // ran out of gas: the sweep is mined and moves nothing. That estimate still
+  // covers everything around the flushes, so each one's gas goes on top.
+  // What is not used is not paid for, though the sweeper's balance must cover
+  // the whole limit.
+  const estimate = await client.estimateContractGas({ ...sweep, account })
+  const wanted = estimate + BigInt(funded.length) * config.sweepFlushGas
+  const gas = wanted > TX_GAS_CAP && estimate <= TX_GAS_CAP ? TX_GAS_CAP : wanted
+  const hash = await wallet.writeContract({ ...sweep, gas })
   const receipt = await client.waitForTransactionReceipt({ hash })
   if (receipt.status !== 'success') throw new Error(`sweep transaction ${hash} reverted`)
 
