@@ -861,6 +861,8 @@ describe('AquiPay', () => {
       const invoice = await createInvoice('first-look')
       await pay(invoice.address, '12')
       await chainClient.mine({ blocks: 40 })
+      // A second old, whatever the machine: the test itself takes less than the 40 blocks do at 1 ms each.
+      await ctx.sql`update invoices set created_at = created_at - interval '1 second' where id = ${invoice.id}`
       const slowBlocks: ChainConfig = { ...chain, minBlockMs: 60_000 }
 
       // Guessing blocks too slow would look back too little; the payment is
@@ -1387,6 +1389,28 @@ describe('AquiPay', () => {
       expect(await sweepTick(ctx, chain)).toBeDefined()
       expect(await usdtBalance(DESTINATION)).toBe(destinationBefore + parseUnits('30', 6))
       expect((await transferRow(frozen.id)).swept_at).not.toBeNull()
+    })
+
+    // The factory catches a flush that fails, so a node's gas estimate for the
+    // sweep can be one at which a flush runs out of gas: the sweep is mined,
+    // moves nothing and reports a healthy address as failed.
+    it('gives every flush the gas a costly token transfer takes', async () => {
+      const destinationBefore = await usdtBalance(DESTINATION)
+      const first = await confirmedInvoice('costly-first', '10')
+      const second = await confirmedInvoice('costly-second', '20')
+      const setTransferWork = async (rounds: bigint) =>
+        mined(await deployer.writeContract({ address: usdt, abi: usdtAbi, functionName: 'setTransferWork', args: [rounds] }))
+      // About 300,000 gas a transfer.
+      await setTransferWork(1000n)
+      try {
+        const sweepTx = await sweepTick(withConfig({ sweepFlushGas: 400_000n }), chain)
+        expect(await usdtBalance(DESTINATION)).toBe(destinationBefore + parseUnits('30', 6))
+        for (const invoice of [first, second]) {
+          expect(await transferRow(invoice.id)).toMatchObject({ swept_tx_hash: sweepTx, sweep_error: null })
+        }
+      } finally {
+        await setTransferWork(0n)
+      }
     })
 
     it('fails the pass when the sweep transaction reverts, and recovers on the next one', async () => {

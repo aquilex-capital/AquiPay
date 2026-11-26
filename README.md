@@ -184,6 +184,10 @@ All `/v1/*` requests need `Authorization: Bearer $API_KEY`.
   is expensive.
 - **Frozen addresses**: if a flush reverts (Tether froze the address), the
   transfer gets a `sweep_error` and is skipped until you clear that column.
+- **Sweep gas**: the factory catches a failed flush, so a node's gas estimate
+  for a sweep can be too low for the flushes inside it. The sweeper adds
+  `SWEEP_FLUSH_GAS` (default 150000) per address on top; raise it if a healthy
+  address is ever parked with `flush failed`. Unused gas is not paid for.
 - **RPC**: one provider per chain is enough; later URLs are fallbacks. The
   defaults fit a free plan such as Alchemy's. The watcher needs `eth_call` at
   past blocks; without it, set `HISTORICAL_READS=false` and it reads logs

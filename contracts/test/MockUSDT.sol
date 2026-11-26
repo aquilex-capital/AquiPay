@@ -10,6 +10,7 @@ contract MockUSDT {
 
     mapping(address => uint256) public balanceOf;
     mapping(address => bool) public frozen;
+    uint256 public transferWork;
 
     event Transfer(address indexed from, address indexed to, uint256 value);
 
@@ -26,8 +27,18 @@ contract MockUSDT {
         frozen[account] = value;
     }
 
+    /// @notice Makes `transfer` cost more gas, as a real token behind a proxy
+    /// does: about 300,000 gas for 1,000 rounds.
+    function setTransferWork(uint256 rounds) external {
+        transferWork = rounds;
+    }
+
     function transfer(address to, uint256 value) external {
         require(!frozen[msg.sender], "frozen");
+        bytes32 work;
+        for (uint256 i = 0; i < transferWork; ++i) {
+            work = keccak256(abi.encode(work));
+        }
         balanceOf[msg.sender] -= value;
         balanceOf[to] += value;
         emit Transfer(msg.sender, to, value);

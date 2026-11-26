@@ -26,6 +26,7 @@ describe('loadConfig', () => {
       publicBaseUrl: 'http://localhost:8080',
       sweepIntervalMs: 3_600_000,
       sweepBatchSize: 50,
+      sweepFlushGas: 150_000n,
       apiKey: undefined,
       sweeperPrivateKey: undefined,
       invoiceTtlSeconds: 600,
@@ -146,6 +147,7 @@ describe('loadConfig', () => {
       SWEEPER_PRIVATE_KEY: `0x${'ab'.repeat(32)}`,
       SWEEP_INTERVAL_SECONDS: '60',
       SWEEP_BATCH_SIZE: '5',
+      SWEEP_FLUSH_GAS: '90000',
     })
     expect(config).toMatchObject({
       port: 9000,
@@ -156,6 +158,7 @@ describe('loadConfig', () => {
       sweeperPrivateKey: `0x${'ab'.repeat(32)}`,
       sweepIntervalMs: 60_000,
       sweepBatchSize: 5,
+      sweepFlushGas: 90_000n,
     })
     expect(config.chains[0]).toMatchObject({
       minTopup: '2.5',
