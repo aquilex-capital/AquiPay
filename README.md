@@ -187,7 +187,10 @@ All `/v1/*` requests need `Authorization: Bearer $API_KEY`.
 - **Sweep gas**: the factory catches a failed flush, so a node's gas estimate
   for a sweep can be too low for the flushes inside it. The sweeper adds
   `SWEEP_FLUSH_GAS` (default 150000) per address on top; raise it if a healthy
-  address is ever parked with `flush failed`. Unused gas is not paid for.
+  address is ever parked with `flush failed`. Unused gas is not paid for, but
+  the sweeper's balance must cover the whole limit, so keep it funded for
+  `SWEEP_BATCH_SIZE` × `SWEEP_FLUSH_GAS` on top of the sweep itself. A limit is
+  held to 16,777,216 gas, the most a transaction may ask for on many chains.
 - **RPC**: one provider per chain is enough; later URLs are fallbacks. The
   defaults fit a free plan such as Alchemy's. The watcher needs `eth_call` at
   past blocks; without it, set `HISTORICAL_READS=false` and it reads logs

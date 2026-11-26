@@ -32,7 +32,7 @@ import { connect, migrate, type Sql } from '../src/db.ts'
 import { dispatchTick, verifySignature } from '../src/dispatcher.ts'
 import { readAddresses } from '../src/chain.ts'
 import { factoryAbi } from '../src/forwarder.ts'
-import { sweepTick } from '../src/sweeper.ts'
+import { sweepTick, TX_GAS_CAP } from '../src/sweeper.ts'
 import { confirmTransfer, watchHorizonSeconds, watcherTick } from '../src/watcher.ts'
 
 const RPC_URL = process.env.TEST_RPC_URL ?? 'http://127.0.0.1:8545'
@@ -1405,12 +1405,21 @@ describe('AquiPay', () => {
       try {
         const sweepTx = await sweepTick(withConfig({ sweepFlushGas: 400_000n }), chain)
         expect(await usdtBalance(DESTINATION)).toBe(destinationBefore + parseUnits('30', 6))
+        // Room for each address, not for one.
+        expect((await chainClient.getTransaction({ hash: sweepTx! })).gas).toBeGreaterThan(2n * 400_000n)
         for (const invoice of [first, second]) {
           expect(await transferRow(invoice.id)).toMatchObject({ swept_tx_hash: sweepTx, sweep_error: null })
         }
       } finally {
         await setTransferWork(0n)
       }
+    })
+
+    it('holds a large batch to the most gas one transaction may ask for', async () => {
+      const invoice = await confirmedInvoice('capped', '10')
+      const sweepTx = await sweepTick(withConfig({ sweepFlushGas: TX_GAS_CAP }), chain)
+      expect((await chainClient.getTransaction({ hash: sweepTx! })).gas).toBe(TX_GAS_CAP)
+      expect(await usdtBalance(invoice.address)).toBe(0n)
     })
 
     it('fails the pass when the sweep transaction reverts, and recovers on the next one', async () => {
